@@ -16,7 +16,7 @@ use regex_macro::regex;
 
 use crate::checks;
 use crate::checks::{LocationFlagChanges, LocationFlagMapping};
-use crate::item::{ItemIdExt, RegulationManager, passive_row, remove_sent_display_items};
+use crate::item::{ItemIdExt, RegulationManager, remove_sent_display_items};
 use crate::save_data::*;
 use crate::slot_data::{EventFlagId, I64Key, SlotData};
 use shared::{Core as SharedCore, CoreBase};
@@ -141,12 +141,6 @@ pub struct Core {
     /// notice when a new one comes in.
     locations_seen: usize,
 
-    /// Goods IDs in the Archipelago range that carry no location and aren't
-    /// blank placeholders, so they stay in the inventory. Remembered so the
-    /// sweep doesn't re-read the regulation (or re-log) for the same item on
-    /// every pass, which would be ten times a second.
-    untagged_item_ids: HashSet<u32>,
-
     /// Whether the local player was dead as of the last tick.
     was_dead: bool,
 
@@ -205,7 +199,6 @@ impl shared::Core for Core {
             last_inventory_scan: None,
             last_virtual_location_sync: None,
             locations_seen: 0,
-            untagged_item_ids: HashSet::new(),
             was_dead: false,
             last_death_count: None,
             last_menu_returns: 0,
@@ -817,9 +810,6 @@ impl Core {
         let Ok(item_man) = (unsafe { MapItemMan::instance_mut() }) else {
             return Ok(());
         };
-        let Some(regulation_manager) = RegulationManager::instance() else {
-            return Ok(());
-        };
 
         // Collect into a separate vector so we aren't borrowing while we make
         // changes. Filtering during the walk keeps it to a handful of entries
@@ -838,82 +828,11 @@ impl Core {
             Vec::new()
         };
         for id in ids {
-            if self.untagged_item_ids.contains(&id.param_id()) {
-                continue;
-            }
-
-            if !matches!(id.category(), ItemCategory::Goods | ItemCategory::Accessory) {
-                // Weapons, protectors, and gems in the Archipelago range are
-                // already real, fully-working items with no hidden location
-                // data to decode (only goods and accessory rows have the
-                // repurposed "vagrant" fields for that); their pickup is
-                // tracked separately, via the lot's event flag. Leave them
-                // in the inventory untouched.
-                continue;
-            }
-
-            let row = regulation_manager
-                .get_equip_param(id)
-                .unwrap_or_else(|| panic!("no row defined for Archipelago ID {:?}", id));
-            let row = passive_row(row.as_dyn()).unwrap_or_else(|| {
-                panic!("Archipelago ID {:?} should be Goods or Accessory", id)
-            });
-
-            let Some(location_id) = row.archipelago_location_id() else {
-                // A placeholder with no location or item data. Local ones are
-                // leftovers, since the real item is granted by location (see
-                // `grant_local_location_items`). Foreign ones just stand in for
-                // another player's item, and their pickup is reported through
-                // the lot's event flag. Neither needs to stay in the inventory.
-                // The `basic_price == 0` check limits this to the randomizer's
-                // blank rows: a row with a price isn't one of them.
-                if row.basic_price() == 0 {
-                    info!(
-                        "Removing untagged {} placeholder {:?}",
-                        if id.is_local_archipelago() {
-                            "local"
-                        } else {
-                            "foreign"
-                        },
-                        id
-                    );
-                    game_data_man.remove_item(id, 1);
-                    continue;
-                }
-
-                // The ID is in the Archipelago range but the row has no
-                // location and carries a price, so it isn't one of the
-                // randomizer's blank placeholders. There's nothing to convert
-                // it to or report. It has to stay in the inventory, because the
-                // code below would delete it.
-                info!(
-                    "Item {:?} is in the Archipelago range but carries no location; \
-                     leaving it in the inventory",
-                    id
-                );
-                self.untagged_item_ids.insert(id.param_id());
-                continue;
-            };
-
-            info!("Inventory contains Archipelago item {:?}", id);
-            info!("  Archipelago location: {}", location_id);
-            save_data.locations.insert(location_id);
-
-            if let Some((real_id, quantity)) = row.archipelago_item() {
-                info!("  Converting to {}x {:?}", quantity, real_id);
-                // Handed over here, so the by-location grant must skip it.
-                save_data.local_virtual_items_granted.insert(location_id);
-                game_data_man.give_item_directly(real_id, quantity);
-            } else {
-                // Any item without local item data is presumably a foreign one,
-                // but log extra details in case there's a bug to track down.
-                info!(
-                    "  Item has no local item data. Basic price: {}, sell value: {}",
-                    row.basic_price(),
-                    row.sell_value()
-                );
-            }
-            info!("  Removing from inventory");
+            info!(
+                "Removing {} placeholder {:?}",
+                if id.is_local_archipelago() { "local" } else { "foreign" },
+                id
+            );
             game_data_man.remove_item(id, 1);
         }
 
