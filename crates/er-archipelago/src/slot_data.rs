@@ -4,10 +4,7 @@ use std::{
     str::FromStr,
 };
 
-use archipelago_rs as ap;
-use eldenring::cs::GameDataMan;
 use eldenring::cs::ItemId;
-use fromsoftware_shared::FromStatic;
 use serde::{Deserialize, Deserializer};
 
 /// Setup info the Archipelago server sends for this game.
@@ -27,14 +24,6 @@ pub struct SlotData {
     #[serde(default)]
     pub non_deprioritized_progression_item_ids: HashSet<i64>,
 
-    /// Location IDs to the event flags that control their map markers.
-    #[serde(default)]
-    pub priority_marker_flags: HashMap<I64Key, EventFlagId>,
-
-    /// Location IDs to what has to be true before their map marker shows.
-    #[serde(default)]
-    pub priority_marker_requirements: HashMap<I64Key, MarkerRequirement>,
-
     /// Real locations to the AP-only virtual locations that get checked along
     /// with them.
     #[serde(default)]
@@ -51,10 +40,6 @@ pub struct SlotData {
     /// the picker still sees a pickup pop-up.
     #[serde(default)]
     pub virtual_location_display_items: HashMap<I64Key, DeserializableItemId>,
-
-    /// Region-lock item IDs to the event flags the region barriers check.
-    #[serde(default)]
-    pub region_lock_item_flags: HashMap<I64Key, EventFlagId>,
 
     /// This player's options.
     pub options: Options,
@@ -83,115 +68,6 @@ impl SlotData {
         self.virtual_location_display_items
             .get(&I64Key(virtual_location_id))
             .map(|display_item| display_item.0)
-    }
-
-    pub fn marker_requirement_met(
-        &self,
-        client: &ap::Client<SlotData>,
-        location_id: i64,
-        inventory: &InventorySnapshot,
-    ) -> bool {
-        self.priority_marker_requirements
-            .get(&I64Key(location_id))
-            .is_some_and(|requirement| {
-                requirement.is_met_with(
-                    &|item_id| self.has_ap_item(client, item_id, inventory),
-                    &|location_id| client.is_local_location_checked(location_id),
-                )
-            })
-    }
-
-    fn has_ap_item(
-        &self,
-        client: &ap::Client<SlotData>,
-        item_id: i64,
-        inventory: &InventorySnapshot,
-    ) -> bool {
-        client
-            .received_items()
-            .iter()
-            .any(|received| received.item().id() == item_id)
-            || self.has_er_inventory_item(item_id, inventory)
-    }
-
-    pub fn has_er_inventory_item(&self, ap_item_id: i64, inventory: &InventorySnapshot) -> bool {
-        let Some(er_id) = self
-            .ap_ids_to_item_ids
-            .get(&I64Key(ap_item_id))
-            .map(|id| id.0)
-        else {
-            return false;
-        };
-
-        inventory.contains(er_id)
-    }
-}
-
-/// A snapshot of the item IDs the player is carrying.
-///
-/// Walking the inventory isn't free and marker requirements ask about lots of
-/// items at once, so we capture it once per sync pass and answer everything
-/// from the snapshot. (It used to be re-walked for every marker, every frame.)
-#[derive(Default)]
-pub struct InventorySnapshot {
-    /// Held item IDs with a quantity above zero. A plain `Vec` because `ItemId`
-    /// isn't hashable, and we only ever look up a handful of items.
-    items: Vec<ItemId>,
-}
-
-impl InventorySnapshot {
-    /// Captures the current inventory, or an empty snapshot if there's no game
-    /// data (like on the main menu).
-    pub fn capture() -> Self {
-        let Ok(game_data_man) = (unsafe { GameDataMan::instance() }) else {
-            return Self::default();
-        };
-
-        Self {
-            items: game_data_man
-                .main_player_game_data
-                .equipment
-                .equip_inventory_data
-                .items_data
-                .items()
-                .filter(|entry| entry.quantity > 0)
-                .map(|entry| entry.item_id)
-                .collect(),
-        }
-    }
-
-    pub fn contains(&self, item_id: ItemId) -> bool {
-        self.items.contains(&item_id)
-    }
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum MarkerRequirement {
-    Item(i64),
-    Location(i64),
-    All(Vec<MarkerRequirement>),
-    Any(Vec<MarkerRequirement>),
-    Never,
-}
-
-impl MarkerRequirement {
-    fn is_met_with(
-        &self,
-        has_item: &impl Fn(i64) -> bool,
-        has_location: &impl Fn(i64) -> bool,
-    ) -> bool {
-        match self {
-            MarkerRequirement::Item(item_id) => has_item(*item_id),
-            MarkerRequirement::Location(location_id) => has_location(*location_id),
-            MarkerRequirement::All(requirements) => requirements
-                .iter()
-                .all(|requirement| requirement.is_met_with(has_item, has_location)),
-            MarkerRequirement::Any(requirements) => requirements
-                .iter()
-                .any(|requirement| requirement.is_met_with(has_item, has_location)),
-            MarkerRequirement::Never => false,
-        }
     }
 }
 

@@ -18,7 +18,7 @@ use crate::checks;
 use crate::checks::{LocationFlagChanges, LocationFlagMapping};
 use crate::item::{ItemIdExt, RegulationManager, passive_row, remove_sent_display_items};
 use crate::save_data::*;
-use crate::slot_data::{EventFlagId, I64Key, InventorySnapshot, SlotData};
+use crate::slot_data::{EventFlagId, I64Key, SlotData};
 use shared::{Core as SharedCore, CoreBase};
 
 const RECEIVED_ITEM_GRANT_INTERVAL: Duration = Duration::from_millis(33);
@@ -31,16 +31,6 @@ const ITEM_GET_DISPLAY_SUPPRESSION_DURATION: Duration = Duration::from_millis(75
 /// the whole table gets swept in ~1.3s at 60fps, which is acceptable for
 /// anything missed by the flag hooks.
 const FLAG_POLL_BATCH_SIZE: usize = 64;
-
-/// How often the priority location markers are recomputed. Each pass walks
-/// every marker's requirement tree, so it runs on a timer instead of every
-/// frame. A marker showing up a quarter second late is unnoticeable.
-const MARKER_SYNC_INTERVAL: Duration = Duration::from_millis(250);
-
-/// How often region-lock item flags are re-derived. Same idea as
-/// [MARKER_SYNC_INTERVAL]: region locks are one-way and never need to react
-/// within a single frame.
-const REGION_LOCK_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How often the inventory is swept for placeholder items. The sweep walks
 /// every carried item, and a placeholder can wait a few frames before it's
@@ -144,8 +134,6 @@ pub struct Core {
     flag_poll_cursor: usize,
 
     /// Timers for the periodic sync passes, so they don't run every frame.
-    last_marker_sync: Option<Instant>,
-    last_region_lock_sync: Option<Instant>,
     last_inventory_scan: Option<Instant>,
     last_virtual_location_sync: Option<Instant>,
 
@@ -214,8 +202,6 @@ impl shared::Core for Core {
             location_flag_mapping: None,
             pending_flag_checks: Vec::new(),
             flag_poll_cursor: 0,
-            last_marker_sync: None,
-            last_region_lock_sync: None,
             last_inventory_scan: None,
             last_virtual_location_sync: None,
             locations_seen: 0,
@@ -261,8 +247,6 @@ impl shared::Core for Core {
         if let Some(save_data) = SaveData::instance() {
             remove_sent_display_items(&save_data.locations);
         }
-        self.sync_region_lock_flags();
-        self.sync_priority_location_markers();
         self.handle_goal()?;
         let died = self.detect_death();
         self.handle_death_link(died)?;
@@ -539,12 +523,7 @@ impl Core {
                         .slot_data()
                         .non_deprioritized_progression_item_ids
                         .contains(&id_key.0));
-            let companion_goods = companion_region_lock_goods(&item.item().name());
             self.grant_received_item(item_man, er_id, quantity, show_item_popup);
-            for goods_id in companion_goods {
-                let companion_id = goods_item_id(*goods_id);
-                self.grant_received_item(item_man, companion_id, 1, show_item_popup);
-            }
 
             save_data.items_granted += 1;
             self.last_item_time = Instant::now();
@@ -726,106 +705,6 @@ impl Core {
                     "Failed to restore item pickup display settings for {:?}: {:#}",
                     restore.id, err
                 );
-            }
-        }
-    }
-
-    fn sync_priority_location_markers(&mut self) {
-        if !due(&mut self.last_marker_sync, MARKER_SYNC_INTERVAL) {
-            return;
-        }
-
-        let Some(client) = self.client() else {
-            return;
-        };
-        if client.slot_data().priority_marker_flags.is_empty() {
-            return;
-        }
-
-        // Walk the inventory once for the whole pass, not once per item per
-        // requirement per marker.
-        let inventory = InventorySnapshot::capture();
-
-        for (location, flag) in &client.slot_data().priority_marker_flags {
-            let visible = !client.is_local_location_checked(location.0)
-                && client
-                    .slot_data()
-                    .marker_requirement_met(client, location.0, &inventory);
-            if get_event_flag(*flag) != Some(visible) {
-                set_event_flag(*flag, visible);
-            }
-        }
-    }
-
-    fn sync_region_lock_flags(&mut self) {
-        if !due(&mut self.last_region_lock_sync, REGION_LOCK_SYNC_INTERVAL) {
-            return;
-        }
-
-        let Some(client) = self.client() else {
-            return;
-        };
-
-        let slot_data = client.slot_data();
-        if slot_data.region_lock_item_flags.is_empty() {
-            return;
-        }
-
-        let received_items = client
-            .received_items()
-            .iter()
-            .map(|received| received.item().id())
-            .collect::<HashSet<_>>();
-
-        // Region-lock items from local virtual locations (like "Priority
-        // Reserve" or own-world placements) are granted by the client and never
-        // show up in `received_items`, so include them here. Otherwise a lock
-        // item found at one would never unlock its region.
-        let local_virtual_granted: HashSet<i64> = SaveData::instance()
-            .map(|save_data| {
-                save_data
-                    .local_virtual_items_granted
-                    .iter()
-                    .filter_map(|location_id| slot_data.local_virtual_location_item(*location_id))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let inventory = InventorySnapshot::capture();
-
-        for (item_id, flag) in &slot_data.region_lock_item_flags {
-            let ap_code = item_id.0;
-
-            // Cheap checks first: the inventory lookup is the expensive part,
-            // and the flag read skips it for locks that are already open.
-            if get_event_flag(*flag) == Some(true) {
-                continue;
-            }
-
-            let owned = received_items.contains(&ap_code)
-                || local_virtual_granted.contains(&ap_code)
-                || slot_data.has_er_inventory_item(ap_code, &inventory);
-
-            // Region locks are one-way: only ever set the flag once the item is
-            // owned, never clear it. Clearing on a temporary "not owned"
-            // (before the client has synced, or offline) would re-lock a region
-            // that's already open.
-            if owned {
-                set_event_flag(*flag, true);
-
-                if let Some(er_id_key) = slot_data.ap_ids_to_item_ids.get(&I64Key(ap_code)) {
-                    let companions = companion_goods_for_er_lock_id(er_id_key.0.param_id());
-                    if !companions.is_empty()
-                        && let Ok(item_man) = unsafe { MapItemMan::instance_mut() }
-                    {
-                        for goods_id in companions {
-                            let companion_id = goods_item_id(*goods_id);
-                            if !has_item_in_inventory(companion_id) {
-                                item_man.grant_item(ItemBufferEntry::new(companion_id, 1));
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1429,57 +1308,6 @@ impl Core {
     }
 }
 
-/// A region-lock item and the companion goods it also grants.
-struct RegionLock {
-    /// The Archipelago item name of the lock.
-    name: &'static str,
-    /// The Elden Ring goods param ID of the lock.
-    er_param_id: u32,
-    /// Goods IDs granted along with the lock.
-    companion_goods: &'static [u32],
-}
-
-const REGION_LOCKS: &[RegionLock] = &[
-    // Dectus Medallion Left, Right
-    RegionLock {
-        name: "Altus Lock",
-        er_param_id: 60003,
-        companion_goods: &[8105, 8106],
-    },
-    // Rold Medallion
-    RegionLock {
-        name: "Mountaintops Lock",
-        er_param_id: 60007,
-        companion_goods: &[8107],
-    },
-    // Haligtree Secret Medallion Left, Right
-    RegionLock {
-        name: "Consecrated Snowfield Lock",
-        er_param_id: 60009,
-        companion_goods: &[8175, 8176],
-    },
-    // Pureblood Knight's Medal
-    RegionLock {
-        name: "Mohgwyn Lock",
-        er_param_id: 60010,
-        companion_goods: &[2160],
-    },
-];
-
-fn companion_region_lock_goods(item_name: &str) -> &'static [u32] {
-    REGION_LOCKS
-        .iter()
-        .find(|lock| lock.name == item_name)
-        .map_or(&[], |lock| lock.companion_goods)
-}
-
-fn companion_goods_for_er_lock_id(er_item_id: u32) -> &'static [u32] {
-    REGION_LOCKS
-        .iter()
-        .find(|lock| lock.er_param_id == er_item_id)
-        .map_or(&[], |lock| lock.companion_goods)
-}
-
 fn has_item_in_inventory(item_id: ItemId) -> bool {
     let Ok(game_data_man) = (unsafe { GameDataMan::instance() }) else {
         return false;
@@ -1491,14 +1319,6 @@ fn has_item_in_inventory(item_id: ItemId) -> bool {
         .items_data
         .items()
         .any(|entry| entry.item_id == item_id && entry.quantity > 0)
-}
-
-fn goods_item_id(goods_id: u32) -> ItemId {
-    let encoded = (ItemCategory::Goods as u32)
-        .checked_shl(28)
-        .and_then(|category| category.checked_add(goods_id))
-        .expect("goods item ID overflow");
-    ItemId::try_from(encoded).expect("invalid goods item ID")
 }
 
 /// Whether a periodic pass is due; records the time if so.
