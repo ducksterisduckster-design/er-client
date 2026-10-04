@@ -40,7 +40,9 @@ pub struct SaveData {
 
     /// Virtual locations whose "sent to someone else" pop-up has already been
     /// shown, so we don't show it twice.
-    pub foreign_virtual_items_notified: HashSet<i64>,
+    ///
+    /// Now deprecated as popups are faked without giving the item.
+    foreign_virtual_items_notified: HashSet<i64>,
 
     /// Set while an NG+ trap is active, so the original NG+ level can be
     /// restored on death, even across a quit and reload.
