@@ -16,7 +16,7 @@ use regex_macro::regex;
 
 use crate::checks;
 use crate::checks::{LocationFlagChanges, LocationFlagMapping};
-use crate::item::{ItemIdExt, RegulationManager, remove_sent_display_items};
+use crate::item::{ItemIdExt, RegulationManager};
 use crate::save_data::*;
 use crate::slot_data::{EventFlagId, I64Key, SlotData};
 use shared::{Core as SharedCore, CoreBase};
@@ -237,9 +237,6 @@ impl shared::Core for Core {
 
         self.process_incoming_items();
         self.process_inventory_items()?;
-        if let Some(save_data) = SaveData::instance() {
-            remove_sent_display_items(&save_data.locations);
-        }
         self.handle_goal()?;
         let died = self.detect_death();
         self.handle_death_link(died)?;
@@ -495,27 +492,16 @@ impl Core {
                 return;
             }
 
-            let source_display_name = received_item_location_display_name(
-                client,
-                item,
-                source_location,
-                &source_location_name,
-            );
-
             info!(
                 "Granting {} (AP ID {}, ER ID {:?} from {})",
                 item.item().name(),
                 item.item().id(),
                 er_id,
-                source_display_name
+                source_location_name
             );
 
             let show_item_popup = show_item_popups
-                || (show_progression_item_popups
-                    && client
-                        .slot_data()
-                        .non_deprioritized_progression_item_ids
-                        .contains(&id_key.0));
+                || (show_progression_item_popups && (item.is_progression() || item.is_useful()));
             self.grant_received_item(item_man, er_id, quantity, show_item_popup);
 
             save_data.items_granted += 1;
@@ -849,14 +835,7 @@ impl Core {
                 VIRTUAL_LOCATION_SYNC_INTERVAL,
             )
         {
-            if let Some(client) = self.client() {
-                client
-                    .slot_data()
-                    .expand_virtual_location_checks(&mut save_data.locations);
-            }
-            self.grant_local_virtual_location_items(item_man, save_data);
             self.grant_local_location_items(item_man, save_data);
-            self.notify_foreign_virtual_location_items(item_man, save_data);
         }
         self.locations_seen = save_data.locations.len();
 
@@ -867,76 +846,6 @@ impl Core {
             self.locations_sent = save_data.locations.len();
         }
         Ok(())
-    }
-
-    fn grant_local_virtual_location_items(
-        &mut self,
-        item_man: &mut MapItemMan,
-        save_data: &mut SaveData,
-    ) {
-        let pending_grants = {
-            let Some(client) = self.client() else {
-                return;
-            };
-            let slot_data = client.slot_data();
-
-            save_data
-                .locations
-                .iter()
-                .copied()
-                .filter(|location_id| {
-                    !save_data
-                        .local_virtual_items_granted
-                        .contains(location_id)
-                })
-                .filter_map(|location_id| {
-                    let ap_item_id = slot_data.local_virtual_location_item(location_id)?;
-                    let Some(er_id) = slot_data.ap_ids_to_item_ids.get(&I64Key(ap_item_id)) else {
-                        warn!(
-                            "Local virtual location {} contains AP item {}, but slot data has no ER item ID",
-                            location_id, ap_item_id
-                        );
-                        return None;
-                    };
-                    let quantity = slot_data
-                        .item_counts
-                        .get(&I64Key(ap_item_id))
-                        .copied()
-                        .unwrap_or(1);
-                    let item_name = client
-                        .this_game()
-                        .item(ap_item_id)
-                        .map(|item| item.name().to_owned())
-                        .unwrap_or_else(|| format!("<item #{}>", ap_item_id));
-                    let location_name = client
-                        .this_game()
-                        .location(location_id)
-                        .map(|location| location.name().to_owned())
-                        .unwrap_or_else(|| format!("<location #{}>", location_id));
-
-                    Some(LocalVirtualItemGrant {
-                        location_id,
-                        location_name,
-                        ap_item_id,
-                        item_name,
-                        er_id: er_id.0,
-                        quantity,
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-
-        for grant in pending_grants {
-            info!(
-                "Granting local virtual {} (AP ID {}, ER ID {:?} from {})",
-                grant.item_name, grant.ap_item_id, grant.er_id, grant.location_name
-            );
-            item_man.grant_item(ItemBufferEntry::new(grant.er_id, grant.quantity));
-            save_data
-                .local_virtual_items_granted
-                .insert(grant.location_id);
-            self.last_item_time = Instant::now();
-        }
     }
 
     /// Makes sure the server has told us which item is at each of this game's
@@ -1025,29 +934,12 @@ impl Core {
             .local_virtual_items_granted
             .contains(&LOCAL_LOCATION_BASELINE_MARKER)
         {
-            let already_checked = {
-                let Some(client) = self.client() else {
-                    return;
-                };
-                let slot_data = client.slot_data();
-                save_data
-                    .locations
-                    .iter()
-                    .copied()
-                    // Virtual locations are granted by their own pass.
-                    .filter(|location_id| slot_data.local_virtual_location_item(*location_id).is_none())
-                    .collect::<Vec<_>>()
-            };
             info!(
                 "Baselining {} already-checked location(s) for by-location grants",
-                already_checked.len()
+                save_data.locations.len()
             );
-            for location_id in already_checked {
-                save_data.local_virtual_items_granted.insert(location_id);
-            }
-            save_data
-                .local_virtual_items_granted
-                .insert(LOCAL_LOCATION_BASELINE_MARKER);
+            save_data.local_virtual_items_granted.extend(&save_data.locations);
+            save_data.local_virtual_items_granted.insert(LOCAL_LOCATION_BASELINE_MARKER);
         }
 
         if !self.update_local_item_scout() {
@@ -1073,10 +965,6 @@ impl Core {
                 })
                 .filter_map(|location_id| {
                     let ap_item_id = *own_items.get(&location_id)?;
-                    // Virtual locations are granted by their own pass.
-                    if slot_data.local_virtual_location_item(location_id).is_some() {
-                        return None;
-                    }
                     let Some(er_id) = slot_data.ap_ids_to_item_ids.get(&I64Key(ap_item_id)) else {
                         warn!(
                             "Location {} contains AP item {}, but slot data has no ER item ID",
@@ -1130,48 +1018,6 @@ impl Core {
             save_data
                 .local_virtual_items_granted
                 .insert(grant.location_id);
-            self.last_item_time = Instant::now();
-        }
-    }
-
-    /// Shows a pickup pop-up for virtual locations whose item is for another
-    /// player. They have no world item, so without this the picker gets no
-    /// feedback for what they sent. Local virtual items are handled in
-    /// [grant_local_virtual_location_items](Self::grant_local_virtual_location_items).
-    fn notify_foreign_virtual_location_items(
-        &mut self,
-        item_man: &mut MapItemMan,
-        save_data: &mut SaveData,
-    ) {
-        let pending_notifications = {
-            let Some(client) = self.client() else {
-                return;
-            };
-            let slot_data = client.slot_data();
-
-            save_data
-                .locations
-                .iter()
-                .copied()
-                .filter(|location_id| {
-                    !save_data
-                        .foreign_virtual_items_notified
-                        .contains(location_id)
-                })
-                .filter_map(|location_id| {
-                    let display_item = slot_data.virtual_location_display_item(location_id)?;
-                    Some((location_id, display_item))
-                })
-                .collect::<Vec<_>>()
-        };
-
-        for (location_id, display_item) in pending_notifications {
-            info!(
-                "Showing foreign virtual location pickup with {:?} from {}",
-                display_item, location_id
-            );
-            crate::item::show_virtual_location_display_item(item_man, display_item, location_id);
-            save_data.foreign_virtual_items_notified.insert(location_id);
             self.last_item_time = Instant::now();
         }
     }
@@ -1313,23 +1159,4 @@ fn set_item_get_display(id: ItemId, display: ItemGetDisplay) -> Result<ItemGetDi
         EquipParamStructMut::EQUIP_PARAM_PROTECTOR_ST(row) => set!(row),
         EquipParamStructMut::EQUIP_PARAM_WEAPON_ST(row) => set!(row),
     })
-}
-
-fn received_item_location_display_name(
-    client: &ap::Client<SlotData>,
-    item: &ap::ReceivedItem,
-    source_location: ap::Location,
-    source_location_name: &str,
-) -> String {
-    if item.sender().team() == client.this_player().team()
-        && item.sender().slot() == client.this_player().slot()
-        && let Some(trigger_id) = client
-            .slot_data()
-            .virtual_location_trigger(source_location.id())
-        && let Some(trigger_location) = client.this_game().location(trigger_id)
-    {
-        format!("{} [{}]", trigger_location.name(), source_location_name)
-    } else {
-        source_location_name.to_owned()
-    }
 }
