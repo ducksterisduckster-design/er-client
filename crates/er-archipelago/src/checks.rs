@@ -15,14 +15,14 @@ use std::ffi::c_void;
 use std::mem;
 use std::sync::{LazyLock, Mutex};
 
-use eldenring::cs::{ItemLotParam_enemy, ItemLotParam_map};
+use eldenring::cs::{ItemLotParam_enemy, ItemLotParam_map, ShopLineupParam, SoloParamRepository};
 use eldenring::param::ITEMLOT_PARAM_ST;
-use fromsoftware_shared::Program;
+use fromsoftware_shared::{FromStatic, Program};
 use shared::hook;
 use log::*;
 use pelite::pe::Pe;
 
-use crate::item::RegulationManager;
+use crate::item::{MenuGaitemList, RegulationManager};
 use crate::rva;
 use crate::slot_data::EventFlagId;
 
@@ -47,6 +47,10 @@ pub struct LocationFlagChanges {
     /// Calling code should verify the flag is actually set. Note event value base flags can
     /// be unset for values >1, but all tracked shop flags have quantity 1 currently.
     set_flags: HashSet<EventFlagId>,
+
+    /// All watched flags which were viewed as a hint from a shop. These flags may or may
+    /// not have been set.
+    hint_flags: HashSet<EventFlagId>,
 }
 
 impl LocationFlagChanges {
@@ -58,20 +62,35 @@ impl LocationFlagChanges {
         }
     }
 
+    /// Mark the given flag as hinted if it is being tracked.
+    pub fn hint_flag(flag: EventFlagId) {
+        let mut changes = INSTANCE.lock().unwrap();
+        if changes.tracked_flags.contains(&flag) {
+            changes.hint_flags.insert(flag);
+        }
+    }
+
     pub fn add_tracked_flags<T>(flags: T) where T : IntoIterator<Item = EventFlagId> {
         let mut changes = INSTANCE.lock().unwrap();
         changes.tracked_flags.extend(flags);
     }
 
-    /// Take all flags added since the last time this was called.
+    /// Take all changed flags added since the last time this was called.
     pub fn take_changed_flags() -> Vec<EventFlagId> {
         let mut changes = INSTANCE.lock().unwrap();
         changes.set_flags.drain().collect()
+    }
+
+    /// Take all hinted flags added since the last time this was called.
+    pub fn take_hinted_flags() -> Vec<EventFlagId> {
+        let mut changes = INSTANCE.lock().unwrap();
+        changes.hint_flags.drain().collect()
     }
 }
 
 type SetEventFlagFn = unsafe extern "C" fn(event_flag_man: *mut c_void, flag: u32, value: i32);
 type SetEventValueFn = unsafe extern "C" fn(event_flag_man: *mut c_void, flag: *const u32, width: u32, value: u32);
+type GetShopMenuListFn = unsafe extern "C" fn(list: *mut *mut MenuGaitemList, shop_type: u8, start: u32, end: u32, mult: f32) -> *mut *mut MenuGaitemList;
 
 fn set_event_flag_override(flag: u32, value: i32, original: &dyn Fn()) {
     original();
@@ -90,6 +109,24 @@ fn set_event_value_override(flag: *const u32, value: u32, original: &dyn Fn()) {
     }
 }
 
+fn get_shop_menu_list_override(original: &dyn Fn() -> *mut *mut MenuGaitemList) -> *mut *mut MenuGaitemList {
+    let list_ptr = original();
+    let Some(params) = unsafe { SoloParamRepository::instance() }.ok() else {
+        return list_ptr;
+    };
+    if let Some(list) = unsafe { list_ptr.as_ref().and_then(|l| l.as_ref()) } {
+        log::info!("Got shop list {:p} {:p} {:p}", &list.items.base.begin, &list.items.base.end, &list.items.base.capacity);
+        for item in list.items.items() {
+            log::info!("{}: Got shop {:?} {}x at {}", item.shop_lineup_param, item.id, item.quantity, item.price);
+            if let Some(shop_row) = params.get::<ShopLineupParam>(item.shop_lineup_param)
+                && shop_row.event_flag_for_stock() > 0 {
+                LocationFlagChanges::hint_flag(EventFlagId(shop_row.event_flag_for_stock()));
+            }
+        }
+    }
+    list_ptr
+}
+
 /// Hooks event flag changes which can detect item pickups and shop purchases
 /// immediately. These are tracked in the [LocationFlagChanges] instance.
 pub unsafe fn hook_flag_changes() {
@@ -97,9 +134,11 @@ pub unsafe fn hook_flag_changes() {
     let rvas = rva::get();
     let set_event_flag_addr = program.rva_to_va(rvas.set_event_flag).unwrap();
     let set_event_value_addr = program.rva_to_va(rvas.set_event_value).unwrap();
+    let get_shop_menu_list_addr = program.rva_to_va(rvas.get_shop_menu_list).unwrap();
     unsafe {
         let set_event_flag = mem::transmute::<u64, SetEventFlagFn>(set_event_flag_addr);
         let set_event_value = mem::transmute::<u64, SetEventValueFn>(set_event_value_addr);
+        let get_shop_menu_list = mem::transmute::<u64, GetShopMenuListFn>(get_shop_menu_list_addr);
         // This uses winhook instead of ilhook as it provides slightly higher-level access
         // to function args, is performant and thread-safe, etc. Both are fine to use together,
         // but committing to one or the other would be fine too.
@@ -114,6 +153,12 @@ pub unsafe fn hook_flag_changes() {
             |original| {
                 move |event_flag_man, flag, width, value|
                     set_event_value_override(flag, value, &|| original(event_flag_man, flag, width, value))
+            });
+        hook::hook(
+            get_shop_menu_list,
+            |original| {
+                move |list, shop_type, start, end, mult|
+                    get_shop_menu_list_override(&|| original(list, shop_type, start, end, mult))
             });
     }
 }

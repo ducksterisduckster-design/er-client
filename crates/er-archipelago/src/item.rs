@@ -1,6 +1,6 @@
-use eldenring::cs::{
+use eldenring::{Vector, cs::{
     ItemBuffer, ItemCategory, ItemId, MAP_ITEM_MAN_GRANT_ITEM_VA, MapItemMan, MapItemManEntry, SoloParamRepository,
-};
+}, dlut::DLReferenceCountObject};
 use fromsoftware_shared::FromStatic;
 use ilhook::x64::*;
 use log::*;
@@ -38,6 +38,33 @@ impl RegulationManager {
     ) -> impl Iterator<Item = (u32, &'a P::StructType)> + 'a {
         self.0.rows::<P>()
     }
+}
+
+// Partial MenuGaitem data for editing shop data
+
+#[repr(C)]
+// Source of name: RTTI
+pub struct MenuGaitemList {
+    ref_count: [u8; 0x10],
+    pub items: Vector<MenuGaitem>,
+}
+
+#[repr(C)]
+// Source of name: RTTI
+pub struct MenuGaitem {
+    /// How many items are remaining in the shop, or -1 for infinite
+    pub quantity: i32,
+    unk0: [u8; 0x20],
+    /// The price of the item
+    pub price: u32,
+    /// Other fields including materials needed to buy the item
+    unk28: [u8; 0x24],
+    /// This item's ID.
+    pub id: ItemId,
+    unk50: [u8; 0xc],
+    /// The ShopLineupParam ID for this item's shop entry.
+    pub shop_lineup_param: u32,
+    unk60: [u8; 0x20],
 }
 
 /// Sets up the hooks that swap placeholder items (which may encode Archipelago
