@@ -470,20 +470,17 @@ impl Core {
                 .copied()
                 .unwrap_or(1);
 
-            // With DLC start enabled, the randomizer's regulation edit already
-            // puts a few items (Spirit Calling Bell and the like) straight into
-            // the new character's starting inventory, on top of sending them
-            // here as ordinary AP start-inventory items (location `Server`).
-            // Granting this copy too would double them up, so skip it once the
-            // player already has it. A non-DLC-start game never bakes these in,
-            // so `has_item_in_inventory` stays false there and this is a no-op.
+            // The randomizer puts some starting items in the player's inventory
+            // if they need to be set up in a particular with (like event flags),
+            // so they do not need to be granted as ordinary AP start-inventory
+            // items (location `-2: Server`). Granting this copy too would double
+            // them up, so skip it if the player already has it.
             if source_location == ap::Location::server()
-                && client.slot_data().options.enable_dlc
                 && has_item_in_inventory(er_id)
             {
                 info!(
-                    "Skipping start-inventory item {} (ER ID {:?}); the randomizer's \
-                     DLC-start regulation edit already granted it",
+                    "Skipping start-inventory item {} (ER ID {:?}) \
+                     already granted by the randomizer",
                     item.item().name(),
                     er_id
                 );
