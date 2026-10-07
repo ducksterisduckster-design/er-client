@@ -608,6 +608,8 @@ fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
             Color { color: Yellow, .. } => YELLOW,
             _ => WHITE,
         };
+        // TODO: This causes significant issues for multi-line messages like !license
+        // as they prevent scrolling down without flickering.
         ui.text_colored(color.with_alpha(alpha).to_rgba_f32s(), part.to_string());
     }
 }

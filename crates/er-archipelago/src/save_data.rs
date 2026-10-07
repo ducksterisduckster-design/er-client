@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use bincode::{Decode, Encode};
+use bincode::{Decode};
+use prost::Message;
 use eldenring::cs::MapItemMan;
 use eldenring_extra::save;
 use fromsoftware_shared::FromStatic;
@@ -19,8 +20,18 @@ static MENU_RETURNS: AtomicU32 = AtomicU32::new(0);
 const CONFIG: bincode::config::Configuration = bincode::config::standard();
 
 /// Data that's saved and loaded along with the player's game save.
-#[derive(Debug, Decode, Encode, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SaveData {
+    /// The seed this save was last connected to. Lets us catch someone loading
+    /// a save while connected to the wrong multiworld.
+    ///
+    /// This is used to indicate whether everything else is initialized or not.
+    pub seed: Option<String>,
+
+    /// The slot this save was last connected to, for multiple apworld instances
+    /// within the same seed.
+    pub slot: Option<u32>,
+
     /// How many Archipelago items from other worlds have been given to the
     /// player in this run.
     pub items_granted: usize,
@@ -29,20 +40,8 @@ pub struct SaveData {
     /// need it, but it keeps us from spamming the server.
     pub locations: HashSet<i64>,
 
-    /// The seed this save was last connected to. Lets us catch someone loading
-    /// a save while connected to the wrong multiworld.
-    pub seed: Option<String>,
-
-    /// Locations whose own-item grant has already been given: virtual ones,
-    /// plus real ones for the by-location grant. Also holds `-1` once the save
-    /// has been baselined for that.
+    /// Locations whose own-item grant has already been given.
     pub local_virtual_items_granted: HashSet<i64>,
-
-    /// Virtual locations whose "sent to someone else" pop-up has already been
-    /// shown, so we don't show it twice.
-    ///
-    /// Now deprecated as popups are faked without giving the item.
-    foreign_virtual_items_notified: HashSet<i64>,
 
     /// Set while an NG+ trap is active, so the original NG+ level can be
     /// restored on death, even across a quit and reload.
@@ -50,24 +49,72 @@ pub struct SaveData {
 }
 
 /// An active NG+ trap.
-#[derive(Debug, Clone, Copy, Decode, Encode)]
+#[derive(Clone, Copy, Decode, Message)]
 pub struct NgTrap {
     /// The NG+ level to go back to when the player dies.
+    #[prost(uint32, tag = "1")]
     pub original: u32,
 
     /// The NG+ level the trap put the game on.
+    #[prost(uint32, tag = "2")]
     pub trapped: u32,
 }
+
+/// SaveData with field types converted to protobuf-friendly forms.
+#[derive(Message)]
+pub struct SaveDataProto {
+    #[prost(string, optional, tag = "1")]
+    pub seed: Option<String>,
+    #[prost(uint32, optional, tag = "2")]
+    pub slot: Option<u32>,
+    #[prost(uint64, tag = "3")]
+    pub items_granted: u64,
+    #[prost(int64, repeated, packed, tag = "4")]
+    pub locations: Vec<i64>,
+    #[prost(int64, repeated, packed, tag = "5")]
+    pub local_virtual_items_granted: Vec<i64>,
+    #[prost(message, tag = "6")]
+    pub ng_trap: Option<NgTrap>,
+}
+
+impl From<SaveDataProto> for SaveData {
+    fn from(data: SaveDataProto) -> Self {
+        Self {
+            seed: data.seed,
+            slot: data.slot,
+            items_granted: data.items_granted as usize,
+            locations: data.locations.into_iter().collect(),
+            local_virtual_items_granted: data.local_virtual_items_granted.into_iter().collect(),
+            ng_trap: data.ng_trap,
+        }
+    }
+}
+
+impl From<SaveData> for SaveDataProto {
+    fn from(data: SaveData) -> Self {
+        Self {
+            seed: data.seed,
+            slot: data.slot,
+            items_granted: data.items_granted as u64,
+            locations: data.locations.into_iter().collect(),
+            local_virtual_items_granted: data.local_virtual_items_granted.into_iter().collect(),
+            ng_trap: data.ng_trap,
+        }
+    }
+}
+
+// TODO: These can probably be removed as they are only in dev saves.
 
 /// The save data layout from before `ng_trap` existed. Only used to keep
 /// loading older saves.
 #[derive(Decode)]
 struct SaveDataV1 {
-    items_granted: usize,
-    locations: HashSet<i64>,
-    seed: Option<String>,
-    local_virtual_items_granted: HashSet<i64>,
-    foreign_virtual_items_notified: HashSet<i64>,
+    pub items_granted: usize,
+    pub locations: HashSet<i64>,
+    pub seed: Option<String>,
+    pub local_virtual_items_granted: HashSet<i64>,
+    #[allow(unused)]
+    pub foreign_virtual_items_notified: HashSet<i64>,
 }
 
 impl From<SaveDataV1> for SaveData {
@@ -77,8 +124,32 @@ impl From<SaveDataV1> for SaveData {
             locations: old.locations,
             seed: old.seed,
             local_virtual_items_granted: old.local_virtual_items_granted,
-            foreign_virtual_items_notified: old.foreign_virtual_items_notified,
-            ng_trap: None,
+            ..Default::default()
+        }
+    }
+}
+
+/// Save data layout from before using protobufs, because it keeps changing.
+#[derive(Decode)]
+pub struct SaveDataV2 {
+    pub items_granted: usize,
+    pub locations: HashSet<i64>,
+    pub seed: Option<String>,
+    pub local_virtual_items_granted: HashSet<i64>,
+    #[allow(unused)]
+    pub foreign_virtual_items_notified: HashSet<i64>,
+    pub ng_trap: Option<NgTrap>,
+}
+
+impl From<SaveDataV2> for SaveData {
+    fn from(old: SaveDataV2) -> Self {
+        Self {
+            items_granted: old.items_granted,
+            locations: old.locations,
+            seed: old.seed,
+            local_virtual_items_granted: old.local_virtual_items_granted,
+            ng_trap: old.ng_trap,
+            ..Default::default()
         }
     }
 }
@@ -98,12 +169,14 @@ impl SaveData {
         unsafe {
             std::mem::forget(save::on_save_load(
                 || {
-                    Self::instance().and_then(|data| match bincode::encode_to_vec(&*data, CONFIG) {
-                        Ok(bytes) => Some(bytes),
-                        Err(err) => {
-                            warn!("Failed to encode save data: {}", err);
-                            None
+                    Self::instance().and_then(|data| {
+                        if data.seed.is_none() {
+                            // Don't write save data if it's not initialized, just in case,
+                            // to prevent corrupting existing save files if alt saves are not used.
+                            return None;
                         }
+                        // Because data can't be moved this does too much copying.
+                        Some(SaveDataProto::from(data.clone()).encode_to_vec())
                     })
                 },
                 |load_type| {
@@ -111,26 +184,27 @@ impl SaveData {
                     let bytes = match load_type {
                         SavedData(bytes) => bytes,
                         MainMenu => {
-                            // Back on the main menu: reset the granted count
-                            // and seed, so a new file starts fresh with no seed
-                            // conflict.
-                            let mut save = INSTANCE.write().unwrap();
-                            save.items_granted = 0;
-                            save.seed = None;
-                            save.ng_trap = None;
+                            // Back on the main menu: reset everything, so a new file
+                            // can start fresh with no seed conflict or collected
+                            // local locations.
+                            *INSTANCE.write().unwrap() = Default::default();
                             MENU_RETURNS.fetch_add(1, Ordering::Relaxed);
                             return;
-                        }
-                        _ => return,
+                        },
+                        NoSavedData => {
+                            // Loading into an uninitialized save file, don't carry
+                            // over previous sav data either.
+                            *INSTANCE.write().unwrap() = Default::default();
+                            return;
+                        },
                     };
 
-                    // Fall back to the older layout so saves made before the NG+
-                    // trap existed still load.
-                    let decoded = decode_exact::<SaveData>(&bytes).or_else(|err| {
-                        decode_exact::<SaveDataV1>(&bytes)
-                            .map(SaveData::from)
-                            .map_err(|_| err)
-                    });
+                    // Currently three layers of decode: protobuf (flexible schema), bincode SaveData
+                    // v2, then bincode v1 before the NG+ trap existed.
+                    // TODO: bincode can probably be removed before release.
+                    let decoded = SaveDataProto::decode(&*bytes).map(SaveData::from)
+                        .or_else(|err| decode_exact::<SaveDataV2>(&bytes).map(SaveData::from).map_err(|_| err))
+                        .or_else(|err| decode_exact::<SaveDataV1>(&bytes).map(SaveData::from).map_err(|_| err));
                     match decoded {
                         Ok(data) => *INSTANCE.write().unwrap() = data,
                         Err(err) => warn!("Failed to load save data: {}", err),

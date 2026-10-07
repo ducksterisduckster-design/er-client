@@ -21,6 +21,7 @@ pub struct SlotData {
     pub item_counts: HashMap<I64Key, u32>,
 
     /// This player's options.
+    #[allow(unused)]
     pub options: Options,
 }
 
@@ -39,6 +40,7 @@ impl From<EventFlagId> for u32 {
 pub struct Options {
     /// Whether the player expects the Elden Ring DLC to be installed.
     #[serde(deserialize_with = "int_to_bool")]
+    #[allow(unused)]
     pub enable_dlc: bool,
 }
 

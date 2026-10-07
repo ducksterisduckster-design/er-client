@@ -22,6 +22,7 @@ ilhook.workspace = true
 json.workspace = true
 log.workspace = true
 pelite.workspace = true
+prost = "0.14.4"
 regex-macro.workspace = true
 regex.workspace = true
 serde.workspace = true
