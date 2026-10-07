@@ -134,6 +134,10 @@ pub struct Core {
     /// How far through `pending_flag_checks` the current sweep has got.
     flag_poll_cursor: usize,
 
+    /// Shop locations whose hints have been sent to the server (or attempted).
+    /// This persists even with save data changes but can be sent again on restart.
+    hinted_locations: HashSet<i64>,
+
     /// Timers for the periodic sync passes, so they don't run every frame.
     last_inventory_scan: Option<Instant>,
     last_virtual_location_sync: Option<Instant>,
@@ -208,6 +212,7 @@ impl shared::Core for Core {
             location_flag_mapping: None,
             pending_flag_checks: Vec::new(),
             flag_poll_cursor: 0,
+            hinted_locations: HashSet::new(),
             last_inventory_scan: None,
             last_virtual_location_sync: None,
             locations_seen: 0,
@@ -824,6 +829,19 @@ impl Core {
 
         // Previously, this removed checked locations from pending_flag_checks,
         // but this wouldn't be reset in the case of creating a new save file.
+
+        let hinted_flags = LocationFlagChanges::take_hinted_flags();
+        let hinted_locs: HashSet<i64> = hinted_flags.iter()
+            .flat_map(|flag| mapping.flag_locations.get(flag)).flatten().copied()
+            .filter(|&loc| self.hinted_locations.insert(loc))
+            .collect();
+        if !hinted_locs.is_empty() && let Some(client) = self.client_mut() {
+            match client.create_hints(hinted_locs.iter().copied()) {
+                Ok(_) => info!("Hinted location IDs: {:?}", hinted_locs),
+                Err(e) => info!("Failed to hint location IDs: {:?}\n{}", hinted_locs, e),
+            };
+        }
+
     }
 
     fn check_location_flags(&self, events: &CSEventFlagMan, save_data: &mut SaveData, location_id: i64) -> bool {
