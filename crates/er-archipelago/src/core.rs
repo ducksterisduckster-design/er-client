@@ -1,7 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-    time::{Duration, Instant},
+    collections::{HashMap, HashSet}, matches, str::FromStr, time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -48,6 +46,10 @@ const VIRTUAL_LOCATION_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 /// by-location grant for the whole session.
 const LOCAL_ITEM_SCOUT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Max allowed IGT for initializing Archipelago in a save file without
+/// player confirmation to avoid immediate item spam.
+const NEW_SAVE_FILE_INIT_PERIOD: Duration = Duration::from_secs(60);
+
 /// The Archipelago item name of the NG+ trap, matched case-insensitively.
 const NG_PLUS_TRAP_ITEM_NAME: &str = "NG+ Trap";
 
@@ -87,10 +89,6 @@ const DEATH_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_NG_LEVEL: u32 = 7;
 
 
-/// Stored in `SaveData::local_virtual_items_granted` once a save has been
-/// baselined for by-location grants. Never a real location ID.
-const LOCAL_LOCATION_BASELINE_MARKER: i64 = -1;
-
 /// Checks an outstanding location scout and returns the result once the server
 /// has answered. Boxed so this file doesn't have to name the Archipelago
 /// client's channel type.
@@ -101,6 +99,10 @@ type ScoutPoll = Box<dyn FnMut() -> Option<Result<Vec<ap::LocatedItem>, ap::Erro
 pub struct Core {
     /// The cross-game core.
     base: CoreBase<crate::game::EldenRing, SlotData>,
+
+    /// State for whether to perform core processing because the player has loaded
+    /// into a preexisting save file, to prevent spamming local and external items.
+    should_process_save_file: ShouldProcess,
 
     /// When we last granted an item to the player. Used to throttle bursts of
     /// incoming items without making release queues take minutes to drain.
@@ -126,8 +128,7 @@ pub struct Core {
     location_flag_mapping: Option<LocationFlagMapping>,
 
     /// Locations still waiting to be seen as checked for poll-based location
-    /// checking, populated when `location_flag_mapping` is set. It is drained
-    /// as locations are found.
+    /// checking, populated when `location_flag_mapping` is set.
     pending_flag_checks: Vec<i64>,
 
     /// How far through `pending_flag_checks` the current sweep has got.
@@ -172,6 +173,16 @@ pub struct Core {
     local_location_items: Option<HashMap<i64, i64>>,
 }
 
+/// Interactive state for allowing processing or not.
+enum ShouldProcess {
+    /// Default state
+    Ok,
+    /// Player has to confirm to start processing
+    AwaitingConfirmation,
+    // Player confirmed and can move to Ok
+    Confirmed,
+}
+
 struct LocalVirtualItemGrant {
     location_id: i64,
     location_name: String,
@@ -189,6 +200,7 @@ impl shared::Core for Core {
     fn new() -> Result<Self> {
         Ok(Self {
             base: CoreBase::new("EldenRing")?,
+            should_process_save_file: ShouldProcess::Ok,
             last_item_time: Instant::now(),
             locations_sent: 0,
             sent_goal: false,
@@ -222,12 +234,10 @@ impl shared::Core for Core {
     /// we're not connected to the server or the mod hit a fatal error.
     fn update_live(&mut self) -> Result<()> {
         self.check_seed_conflict()?;
-        if let Some(save_data) = SaveData::instance_mut().as_mut()
-            && save_data.seed.is_none()
-        {
-            save_data.seed = Some(self.seed().to_string());
-        };
-
+        if !self.check_save_valid() {
+            // Not a fatal error but prevents further processing
+            return Ok(());
+        }
         
         self.restore_expired_item_get_displays();
 
@@ -241,6 +251,7 @@ impl shared::Core for Core {
         let died = self.detect_death();
         self.handle_death_link(died)?;
         self.handle_ng_trap(died);
+        self.set_player_presence();
 
         Ok(())
     }
@@ -354,7 +365,14 @@ impl shared::Core for Core {
                 ]);
 
                 true
-            }
+            },
+
+            "!overridesave" => {
+                if matches!(self.should_process_save_file, ShouldProcess::AwaitingConfirmation) {
+                    self.should_process_save_file = ShouldProcess::Confirmed;
+                }
+                true
+            },
 
             _ => false,
         }
@@ -407,7 +425,60 @@ impl Core {
         }
     }
 
+    fn check_save_valid(&mut self) -> bool {
+        let Some(mut save_data) = SaveData::instance_mut() else {
+            return false;
+        };
+        if save_data.seed.is_none()
+        {
+            if self.should_init_save_file() {
+                info!("Initializing save file with {}", self.seed());
+                save_data.seed = Some(self.seed().to_owned());
+            } else {
+                return false;
+            }
+        }
+        if !matches!(self.should_process_save_file, ShouldProcess::Ok) {
+            self.log("Continuing with current save file");
+            self.should_process_save_file = ShouldProcess::Ok;
+            log::info!("Locations {:?}", save_data.locations);
+        }
+        return true;
+    }
     
+    /// Game check for whether the save file can be safely initialized with Archipelago data.
+    fn should_init_save_file(&mut self) -> bool {
+        if matches!(self.should_process_save_file, ShouldProcess::Confirmed) {
+            return true;
+        }
+        let newly_created = unsafe { GameDataMan::instance() }
+            .map(|game_data_man| Duration::from_millis(game_data_man.play_time.into()) < NEW_SAVE_FILE_INIT_PERIOD)
+            .unwrap_or(false);
+        if newly_created {
+            return true;
+        }
+        if matches!(self.should_process_save_file, ShouldProcess::Ok) {
+            self.log(RichText::Color {
+                text: "Error: Loaded into Elden Ring with a save file which wasn't created with the client active.".into(),
+                color: ap::TextColor::Red,
+            });
+            self.log(RichText::Color {
+                text: "If you loaded into the wrong save file: Create a new save file or switch to the correct save file.".into(),
+                color: ap::TextColor::Red,
+            });
+            self.log(RichText::Color {
+                text: "If you want to use this save file anyway: Type !overridesave to confirm.".into(),
+                color: ap::TextColor::Red,
+            });
+            self.log(RichText::Color {
+                // If need be, we can show the received item index and compute the location list just for this.
+                text: "(Warning: This may resend ALL items you've ever picked up or received from other players!)".into(),
+                color: ap::TextColor::Red,
+            });
+            self.should_process_save_file = ShouldProcess::AwaitingConfirmation;
+        }
+        return false;
+    }
 
     /// Hands new items to the player when appropriate. Also sets up the
     /// [SaveData] for a new file.
@@ -712,9 +783,7 @@ impl Core {
     /// flag is the only signal.
     ///
     /// Only [FLAG_POLL_BATCH_SIZE] locations are checked per call, picking up
-    /// where the last call stopped, and a location is dropped once it's known
-    /// to be checked. So the cost per frame is capped and falls as the run goes
-    /// on.
+    /// where the last call stopped, so the cost per frame is capped.
     fn poll_flag_based_checks(&mut self, save_data: &mut SaveData) {
         if !self.ensure_location_flag_mapping() {
             return;
@@ -747,15 +816,14 @@ impl Core {
                 self.flag_poll_cursor = 0;
             }
             let location_id = self.pending_flag_checks[self.flag_poll_cursor];
+            self.flag_poll_cursor += 1;
             if self.check_location_flags(events, save_data, location_id) {
                 checked_locations.insert(location_id);
             }
         }
 
-        // Retire checked locations from future polling.
-        if !checked_locations.is_empty() {
-            self.pending_flag_checks.retain(|location_id| !checked_locations.contains(location_id));
-        }
+        // Previously, this removed checked locations from pending_flag_checks,
+        // but this wouldn't be reset in the case of creating a new save file.
     }
 
     fn check_location_flags(&self, events: &CSEventFlagMan, save_data: &mut SaveData, location_id: i64) -> bool {
@@ -777,8 +845,9 @@ impl Core {
         if checked && !already_checked {
             info!("Archipelago location {} checked via event flag", location_id);
             save_data.locations.insert(location_id);
+            return true;
         }
-        checked
+        return false;
     }
 
     /// Removes placeholder items from the inventory and tells the server their
@@ -923,22 +992,9 @@ impl Core {
     ///
     /// Handled locations are tracked in
     /// `SaveData::local_virtual_items_granted`, which is saved, so each
-    /// location grants at most once. The first time this runs for a save, every
-    /// already-checked location is recorded as handled *without* granting, so
-    /// an old save isn't flooded with items for pickups it made long ago.
+    /// location grants at most once. This can spam a lot when loading into
+    /// a preexisting save file which is what !overridesave is for.
     fn grant_local_location_items(&mut self, item_man: &mut MapItemMan, save_data: &mut SaveData) {
-        if !save_data
-            .local_virtual_items_granted
-            .contains(&LOCAL_LOCATION_BASELINE_MARKER)
-        {
-            info!(
-                "Baselining {} already-checked location(s) for by-location grants",
-                save_data.locations.len()
-            );
-            save_data.local_virtual_items_granted.extend(&save_data.locations);
-            save_data.local_virtual_items_granted.insert(LOCAL_LOCATION_BASELINE_MARKER);
-        }
-
         if !self.update_local_item_scout() {
             return;
         }
@@ -1067,6 +1123,14 @@ impl Core {
         }
 
         Ok(())
+    }
+
+    /// Applies speffect 81000001 which randomizer uses to confirm the client is connected.
+    fn set_player_presence(&self) {
+        if let Ok(world_chr_man) = (unsafe { WorldChrMan::instance_mut() })
+            && let Some(player) = world_chr_man.main_player.as_mut() {
+            player.apply_speffect( 81000001, true);
+        };
     }
 }
 

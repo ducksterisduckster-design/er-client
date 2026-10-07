@@ -31,11 +31,10 @@ pub struct SaveData {
 
     /// The seed this save was last connected to. Lets us catch someone loading
     /// a save while connected to the wrong multiworld.
+    /// This is used to indicate whether the save data as a whole is initialized or not.
     pub seed: Option<String>,
 
-    /// Locations whose own-item grant has already been given: virtual ones,
-    /// plus real ones for the by-location grant. Also holds `-1` once the save
-    /// has been baselined for that.
+    /// Locations whose own-item grant has already been given.
     pub local_virtual_items_granted: HashSet<i64>,
 
     /// Virtual locations whose "sent to someone else" pop-up has already been
@@ -98,11 +97,18 @@ impl SaveData {
         unsafe {
             std::mem::forget(save::on_save_load(
                 || {
-                    Self::instance().and_then(|data| match bincode::encode_to_vec(&*data, CONFIG) {
-                        Ok(bytes) => Some(bytes),
-                        Err(err) => {
-                            warn!("Failed to encode save data: {}", err);
-                            None
+                    Self::instance().and_then(|data| {
+                        if data.seed.is_none() {
+                            // Don't write save data if it's not initialized, just in case,
+                            // to prevent corrupting existing save files if alt saves are not used.
+                            return None;
+                        }
+                        match bincode::encode_to_vec(&*data, CONFIG) {
+                            Ok(bytes) => Some(bytes),
+                            Err(err) => {
+                                warn!("Failed to encode save data: {}", err);
+                                None
+                            },
                         }
                     })
                 },
@@ -111,17 +117,19 @@ impl SaveData {
                     let bytes = match load_type {
                         SavedData(bytes) => bytes,
                         MainMenu => {
-                            // Back on the main menu: reset the granted count
-                            // and seed, so a new file starts fresh with no seed
-                            // conflict.
-                            let mut save = INSTANCE.write().unwrap();
-                            save.items_granted = 0;
-                            save.seed = None;
-                            save.ng_trap = None;
+                            // Back on the main menu: reset everything, so a new file
+                            // can start fresh with no seed conflict or collected
+                            // local locations.
+                            *INSTANCE.write().unwrap() = Default::default();
                             MENU_RETURNS.fetch_add(1, Ordering::Relaxed);
                             return;
-                        }
-                        _ => return,
+                        },
+                        NoSavedData => {
+                            // Loading into an uninitialized save file, don't carry
+                            // over previous sav data either.
+                            *INSTANCE.write().unwrap() = Default::default();
+                            return;
+                        },
                     };
 
                     // Fall back to the older layout so saves made before the NG+
