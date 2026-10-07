@@ -1,6 +1,7 @@
-use eldenring::{Vector, cs::{
-    ItemBuffer, ItemCategory, ItemId, MAP_ITEM_MAN_GRANT_ITEM_VA, MapItemMan, MapItemManEntry, SoloParamRepository,
-}, dlut::DLReferenceCountObject};
+use eldenring::{
+    Vector,
+    cs::{ItemBuffer, ItemCategory, ItemId, MAP_ITEM_MAN_GRANT_ITEM_VA, MapItemMan, MapItemManEntry, SoloParamRepository},
+};
 use fromsoftware_shared::FromStatic;
 use ilhook::x64::*;
 use log::*;

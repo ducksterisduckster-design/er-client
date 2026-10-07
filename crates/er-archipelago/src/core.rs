@@ -238,7 +238,7 @@ impl shared::Core for Core {
     /// Updates the game logic and checks for common errors. Does nothing if
     /// we're not connected to the server or the mod hit a fatal error.
     fn update_live(&mut self) -> Result<()> {
-        self.check_seed_conflict()?;
+        self.check_seed_slot_conflict()?;
         if !self.check_save_valid() {
             // Not a fatal error but prevents further processing
             return Ok(());
@@ -392,18 +392,20 @@ impl Core {
     /// Errors if the server, the save and/or the config disagree about the
     /// current seed. If the save has no seed yet, fills it in from what's
     /// available.
-    fn check_seed_conflict(&mut self) -> Result<()> {
+    fn check_seed_slot_conflict(&mut self) -> Result<()> {
         let client_seed = self.client().map(|c| c.seed_name());
+        let client_slot = self.client().map(|c| c.this_player().slot());
         let save = SaveData::instance();
         let save_seed = save.as_ref().and_then(|s| s.seed.as_ref());
+        let save_slot = save.as_ref().and_then(|s| s.slot);
 
         match (client_seed, save_seed) {
             (Some(client_seed), _) if client_seed != self.seed() => bail!(
                 "You've connected to a different Archipelago multiworld than the one that \
-                 EldenRingArchipelagoRandomizer.exe used!\n\
-                 \n\
-		 Connected room seed: {}\n\
-                 EldenRingArchipelagoRandomizer.exe seed: {}",
+                EldenRingArchipelagoRandomizer.exe used!\n\
+                \n\
+                Connected room seed: {}\n\
+                EldenRingArchipelagoRandomizer.exe seed: {}",
                 client_seed,
                 self.seed()
             ),
@@ -411,23 +413,39 @@ impl Core {
                 "You've connected to a different Archipelago multiworld than the one that \
                  you used before with this save!\n\
                  \n\
-		 Connected room seed: {}\n\
-		 Save file seed: {}",
+                Connected room seed: {}\n\
+                Save file seed: {}",
                 client_seed,
                 save_seed
             ),
             (_, Some(save_seed)) if self.seed() != save_seed => bail!(
                 "Your most recent EldenRingArchipelagoRandomizer.exe invocation connected to a \
-                 different Archipealgo multiworld than the one that you used before with this \
-                 save!\n\
-                 \n\
-                 EldenRingArchipelagoRandomizer.exe seed: {}\n\
-                 Save file seed: {}",
+                different Archipealgo multiworld than the one that you used before with this \
+                save!\n\
+                \n\
+                EldenRingArchipelagoRandomizer.exe seed: {}\n\
+                Save file seed: {}",
                 self.seed(),
                 save_seed
             ),
             _ => Ok(()),
-        }
+        }.and_then(|_| {
+            // Seed is correct so make one more check for slot if both are present.
+            // To go even further, validate the room is correct, which requires data storage.
+            match (client_slot, save_slot) {
+                // For better error message, show slot name, but this is reasonably usable still.
+                (Some(client_slot), Some(save_slot)) if client_slot != save_slot => bail!(
+                    "You've connected to a different Archipelago multiworld slot than the one that \
+                    you used before with this save!\n\
+                    \n\
+                    Connected room slot number: {}\n\
+                    Save file slot number: {}",
+                    client_slot,
+                    save_slot),
+                _ => Ok(()),
+            }
+        })
+
     }
 
     fn check_save_valid(&mut self) -> bool {
@@ -443,6 +461,12 @@ impl Core {
                 return false;
             }
         }
+        if save_data.slot.is_none()
+            && let Some(client_slot) = self.client().map(|c| c.this_player().slot()) {
+            save_data.slot = Some(client_slot);
+        }
+        // If not OK, we previously showed an error message, so indicate things are fine now,
+        // either because of !overridesave or because of loading the correct save file.
         if !matches!(self.should_process_save_file, ShouldProcess::Ok) {
             self.log("Continuing with current save file");
             self.should_process_save_file = ShouldProcess::Ok;
