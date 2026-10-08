@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use std::{io, iter::ExactSizeIterator, mem};
 
 use anyhow::{Error, Result, bail};
-use archipelago_rs as ap;
+use archipelago_rs::{self as ap, RichText};
 use log::*;
 use serde::de::DeserializeOwned;
 use ustr::Ustr;
@@ -12,10 +12,6 @@ use crate::{Game, SectionProfiler, config::Config};
 
 /// The maximum number of log messages to store.
 const LOG_BUFFER_LIMIT: usize = 1000;
-
-/// The grace period between MapItemMan starting to exist and the mod beginning
-/// to take actions.
-const GRACE_PERIOD: Duration = Duration::from_secs(10);
 
 /// The base struct for implementations of [Core].
 pub struct CoreBase<G: Game, S: DeserializeOwned + Send + 'static> {
@@ -193,6 +189,13 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.config.show_progression_item_popups()
     }
 
+    /// Returns whether the player has been loaded into the game for the given
+    /// duration. This should be used in [Core::update_live] to prevent instant
+    /// in-game popups and otherwise allow game state to catch up before processing.
+    pub fn past_grace_period(&self, duration: Duration) -> bool {
+        self.load_time.map(|time| time.elapsed() > duration).unwrap_or(false)
+    }
+
     /// Returns the list of all logs that have been emitted in the current
     /// session.
     pub(crate) fn logs(&self) -> impl ExactSizeIterator<Item = &(ap::Print, Instant)> {
@@ -257,10 +260,12 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
                 Error(err) => self.log(err.to_string()),
                 Print(print) => {
                     info!("[APS] {print}");
-                    if self.log_buffer.len() >= LOG_BUFFER_LIMIT {
-                        self.log_buffer.pop_front();
+                    if !self.should_suppress_print(&print) {
+                        if self.log_buffer.len() >= LOG_BUFFER_LIMIT {
+                            self.log_buffer.pop_front();
+                        }
+                        self.log_buffer.push_back((print, Instant::now()));
                     }
-                    self.log_buffer.push_back((print, Instant::now()));
                 }
                 _ => {}
             }
@@ -288,6 +293,16 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         } else {
             Ok(())
         }
+    }
+
+    /// Whether to suppress non-actionable server messages to prevent client
+    /// user/developer toil. This appears in server logs and local logs so
+    /// interested parties can still track it.
+    fn should_suppress_print(&self, print: &ap::Print) -> bool {
+        // TODO: Update to websocket library supporting it as soon as available.
+        // Sorry, website hosts.
+        print.data().iter().any(|part|
+            matches!(part, RichText::Text(text) if text.contains("Warning: your client does not support compressed websocket connections")))
     }
 
     /// Writes a message to the log buffer that we display to the user in the
@@ -432,12 +447,6 @@ pub trait Core: Send + Sized {
                 .retain(|event| !matches!(event, ap::Event::DeathLink { .. }));
         } else if self.base().load_time.is_none() {
             self.base_mut().load_time = Some(Instant::now());
-        }
-
-        if let Some(time) = self.base().load_time
-            && time.elapsed() < GRACE_PERIOD
-        {
-            return;
         }
 
         self.base_mut().error = match self

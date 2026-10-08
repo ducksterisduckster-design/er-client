@@ -1,6 +1,6 @@
 [package]
 name = "er-archipelago"
-version = "0.8.3"
+version = "0.1.0"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
