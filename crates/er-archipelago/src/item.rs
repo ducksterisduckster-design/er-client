@@ -96,20 +96,25 @@ fn on_grant_items(item_man: &mut MapItemMan, items: &mut ItemBuffer) {
     while index < items.len() {
         let item = items[index];
 
-        if !item.id.is_archipelago() {
+        let Some(item_id) = item.id.as_valid() else {
+            // Some item lots only set flags, like Patches 20320
+            index += 1;
+            continue;
+        };
+        if !item_id.is_archipelago() {
             // A vanilla item.
-            info!("Received {}x {:?}", item.quantity, item.id);
+            info!("Received {}x {:?}", item.quantity, item_id);
             index += 1;
             continue;
         } else {
             // Archipelago items never show up in inventory and are only identified
             // by flag changes.
-            info!("Received {}x {:?} (Archipelago item)", item.quantity, item.id);
+            info!("Received {}x {:?} (Archipelago item)", item.quantity, item_id);
             items.remove(index);
-            if item.id.is_foreign_archipelago() {
+            if item_id.is_foreign_archipelago() {
                 // Show dialog for foreign items, as local items will be later received by location.
                 // This can fail when the queue is already full which is fine.
-                let _ = item_man.item_award_queue.push(MapItemManEntry::new(item.id, 1));
+                let _ = item_man.item_award_queue.push(MapItemManEntry::new(item_id, 1));
             }
         }
     }
