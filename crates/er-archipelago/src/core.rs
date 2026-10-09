@@ -50,6 +50,16 @@ const LOCAL_ITEM_SCOUT_TIMEOUT: Duration = Duration::from_secs(15);
 /// player confirmation to avoid immediate item spam.
 const NEW_SAVE_FILE_INIT_PERIOD: Duration = Duration::from_secs(60);
 
+/// The grace period between MapItemMan starting to exist and the mod beginning
+/// to take actions.
+const LOAD_GRACE_PERIOD: Duration = Duration::from_secs(6);
+
+/// Speffect to apply always to indicate the client is present.
+/// This should be set within a second of event scripts starting to run.
+const LOADED_SPEFFECT: i32 = 81000001;
+/// Speffect to apply if all processing is being successfully completely.
+const PROCESSING_SPEFFECT: i32 = 81000002;
+
 /// The Archipelago item name of the NG+ trap, matched case-insensitively.
 const NG_PLUS_TRAP_ITEM_NAME: &str = "NG+ Trap";
 
@@ -238,6 +248,12 @@ impl shared::Core for Core {
     /// Updates the game logic and checks for common errors. Does nothing if
     /// we're not connected to the server or the mod hit a fatal error.
     fn update_live(&mut self) -> Result<()> {
+        self.set_player_presence(LOADED_SPEFFECT);
+        crate::icons::load_tpf();
+        if !self.base().past_grace_period(LOAD_GRACE_PERIOD) {
+            return Ok(());
+        }
+
         self.check_seed_slot_conflict()?;
         if !self.check_save_valid() {
             // Not a fatal error but prevents further processing
@@ -256,7 +272,7 @@ impl shared::Core for Core {
         let died = self.detect_death();
         self.handle_death_link(died)?;
         self.handle_ng_trap(died);
-        self.set_player_presence();
+        self.set_player_presence(PROCESSING_SPEFFECT);
 
         Ok(())
     }
@@ -1168,10 +1184,10 @@ impl Core {
     }
 
     /// Applies speffect 81000001 which randomizer uses to confirm the client is connected.
-    fn set_player_presence(&self) {
+    fn set_player_presence(&self, sp_effect: i32) {
         if let Ok(world_chr_man) = (unsafe { WorldChrMan::instance_mut() })
             && let Some(player) = world_chr_man.main_player.as_mut() {
-            player.apply_speffect( 81000001, true);
+            player.apply_speffect(sp_effect, true);
         };
     }
 }

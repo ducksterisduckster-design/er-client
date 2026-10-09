@@ -1,6 +1,6 @@
 [package]
 name = "er-archipelago"
-version = "0.8.3"
+version = "0.1.0"
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
@@ -29,6 +29,7 @@ serde.workspace = true
 serde_repr.workspace = true
 shared.workspace = true
 windows.workspace = true
+zip = "9.0.0"
 
 [features]
 # Enable runtime profiling
