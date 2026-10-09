@@ -29,6 +29,7 @@ serde.workspace = true
 serde_repr.workspace = true
 shared.workspace = true
 windows.workspace = true
+zip = "9.0.0"
 
 [features]
 # Enable runtime profiling

@@ -13,3 +13,7 @@ captures = ["buy_menu_gaitem"]
 [[patterns]]
 pattern = "44 8b 49 08 44 8b 41 04 0f b6 11 48 8b cb e8 $ { ' }"
 captures = ["", "get_shop_menu_list"]
+
+[[patterns]]
+pattern = "44 89 6c 24 28 44 88 64 24 20 4d 8b ce 4c 8b c7 48 8b d3 e8 $ { ' }"
+captures = ["", "load_tpf_res_cap"]

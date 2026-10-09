@@ -11,6 +11,7 @@ use super::RvaBundle;
 pub const RVAS: RvaBundle = RvaBundle {
 buy_menu_gaitem: 0x79a790,
 get_shop_menu_list: 0x84e7c0,
+load_tpf_res_cap: 0xb84da0,
 set_event_flag: 0x5faa40,
 set_event_value: 0x5d3080,
 };

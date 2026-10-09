@@ -12,6 +12,7 @@
 pub struct RvaBundle {
 pub buy_menu_gaitem: u32,
 pub get_shop_menu_list: u32,
+pub load_tpf_res_cap: u32,
 pub set_event_flag: u32,
 pub set_event_value: u32,
 }

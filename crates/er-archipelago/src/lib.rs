@@ -4,6 +4,7 @@ use windows::Win32::{Foundation::HINSTANCE, System::SystemServices::DLL_PROCESS_
 mod checks;
 mod core;
 mod game;
+mod icons;
 mod item;
 mod rva;
 mod save_data;

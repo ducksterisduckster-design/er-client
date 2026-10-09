@@ -249,6 +249,7 @@ impl shared::Core for Core {
     /// we're not connected to the server or the mod hit a fatal error.
     fn update_live(&mut self) -> Result<()> {
         self.set_player_presence(LOADED_SPEFFECT);
+        crate::icons::load_tpf();
         if !self.base().past_grace_period(LOAD_GRACE_PERIOD) {
             return Ok(());
         }
