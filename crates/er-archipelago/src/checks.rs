@@ -23,7 +23,7 @@ use shared::hook;
 use log::*;
 use pelite::pe::Pe;
 
-use crate::item::{MenuGaitemList, RegulationManager};
+use crate::item::{MenuGaitem, MenuGaitemList, RegulationManager};
 use crate::rva;
 use crate::slot_data::EventFlagId;
 
@@ -117,15 +117,21 @@ fn send_hints(list_ptr: *mut *mut MenuGaitemList) {
         return;
     };
     if let Some(list) = unsafe { list_ptr.as_ref().and_then(|l| l.as_ref()) } {
-        // If this proves too unstable, iterating from shop start to end range is also possible.
         for item in list.items.items() {
             if item.quantity > 0
+                && !is_remembrance_shop_item(item)
                 && let Some(shop_row) = params.get::<ShopLineupParam>(item.shop_lineup_param)
                 && shop_row.event_flag_for_stock() > 0 {
                 LocationFlagChanges::hint_flag(EventFlagId(shop_row.event_flag_for_stock()));
             }
         }
     }
+}
+
+/// Remembrance shops are not filtered based on event flags but based on having the item,
+/// so use shop range for now as it should be stable.
+fn is_remembrance_shop_item(item: &MenuGaitem) -> bool {
+    (101898..101950).contains(&item.shop_lineup_param)
 }
 
 fn get_shop_menu_list_override(original: &dyn Fn() -> *mut *mut MenuGaitemList) -> *mut *mut MenuGaitemList {

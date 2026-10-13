@@ -96,7 +96,7 @@ const DEATH_LINK_CAUSE: &str = "Elden Ring died";
 /// is spotted through several signals that don't all change on the same frame,
 /// and a real second death can't happen faster than the death screen and
 /// respawn allow.
-const DEATH_COOLDOWN: Duration = Duration::from_secs(10);
+const DEATH_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// The highest NG+ cycle the game has.
 const MAX_NG_LEVEL: u32 = 7;
