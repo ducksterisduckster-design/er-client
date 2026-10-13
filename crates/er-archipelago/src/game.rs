@@ -2,6 +2,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use eldenring::cs::CSEventFlagMan;
 use eldenring::{
     cs::{
         CSFeManHudState, CSFeManImp, CSTaskGroupIndex, CSTaskImp, GameDataMan, MapItemMan, PlayerIns,
@@ -140,13 +141,19 @@ impl EldenRing {
     /// Call this on the main thread, with no other references to the game's
     /// internal state alive.
     pub unsafe fn set_ng_level(level: u32) -> bool {
-        match unsafe { GameDataMan::instance_mut() } {
-            Ok(data) => {
-                data.ng_lvl = level;
-                true
-            }
-            Err(_) => false,
+        let Ok(events) = (unsafe { CSEventFlagMan::instance_mut() }) else {
+            return false;
+        };
+        let Ok(game_data_man) = (unsafe { GameDataMan::instance_mut() }) else {
+            return false;
+        };
+        game_data_man.ng_lvl = level;
+        // These flags are also used for some environment traps plus Romina's butterflies
+        let ng_flag = 50 + level.min(7);
+        for flag in 50u32..58 {
+            events.virtual_memory_flag.set_flag(flag, flag == ng_flag);
         }
+        return true;
     }
 }
 

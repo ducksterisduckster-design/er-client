@@ -9,7 +9,6 @@ use eldenring::cs::*;
 use eldenring::param::EquipParamStructMut;
 use fromsoftware_shared::FromStatic;
 use log::*;
-#[cfg(debug_assertions)]
 use regex_macro::regex;
 
 use crate::checks;
@@ -61,8 +60,11 @@ const LOADED_SPEFFECT: i32 = 81000001;
 /// Speffect to apply if all processing is being successfully completely.
 const PROCESSING_SPEFFECT: i32 = 81000002;
 
-/// The Archipelago item name of the NG+ trap, matched case-insensitively.
+/// The Archipelago item name of the NG+ trap.
 const NG_PLUS_TRAP_ITEM_NAME: &str = "NG+ Trap";
+
+/// All Archipelago trap names.
+const TRAP_ITEM_NAMES: [&str; 1] = [NG_PLUS_TRAP_ITEM_NAME];
 
 /// Picks how many NG+ levels a trap raises the game by, from 1 to 7 (still
 /// capped at NG+7 overall). Uses a lightweight PRNG rather than a `rand`
@@ -94,7 +96,7 @@ const DEATH_LINK_CAUSE: &str = "Elden Ring died";
 /// is spotted through several signals that don't all change on the same frame,
 /// and a real second death can't happen faster than the death screen and
 /// respawn allow.
-const DEATH_COOLDOWN: Duration = Duration::from_secs(10);
+const DEATH_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// The highest NG+ cycle the game has.
 const MAX_NG_LEVEL: u32 = 7;
@@ -171,6 +173,10 @@ pub struct Core {
     /// When the last death was noticed. See [DEATH_COOLDOWN].
     last_death_at: Option<Instant>,
 
+    /// Mapping from a trap's item to the apworld item name, which is used to
+    /// trigger it and then remove it from inventory.
+    trap_items: HashMap<ItemId, String>,
+
     /// The NG+ level a trap just restored, waiting to be announced once the
     /// player has respawned (the overlay only keeps a message for a few
     /// seconds, and the death and loading screens can use them all up).
@@ -236,6 +242,7 @@ impl shared::Core for Core {
             last_death_count: None,
             last_menu_returns: 0,
             last_death_at: None,
+            trap_items: HashMap::new(),
             ng_trap_restored: None,
             local_item_scout: None,
             local_item_scout_requested: None,
@@ -346,7 +353,6 @@ impl shared::Core for Core {
                 true
             }
 
-            #[cfg(debug_assertions)]
             "!ngtrap" => {
                 if let Some(save_data) = SaveData::instance_mut().as_mut() {
                     self.start_ng_trap(save_data);
@@ -354,7 +360,6 @@ impl shared::Core for Core {
                 true
             }
 
-            #[cfg(debug_assertions)]
             "!setevent" => {
                 let Some((flag, value)) = arg.and_then(|a| {
                     let args = regex!(" +").split(a).collect::<Vec<_>>();
@@ -393,6 +398,31 @@ impl shared::Core for Core {
                     },
                 ]);
 
+                true
+            },
+
+            "!removeitem" => {
+                let Some(name) = arg else {
+                    arg_error("!removeitem ITEM NAME");
+                    return true;
+                };
+                match self.remove_item_for_console(name) {
+                    Ok(_) => {
+                        self.log(vec![
+                            "Removed ".into(),
+                            RichText::Color {
+                                text: name.into(),
+                                color: ap::TextColor::Blue,
+                            },
+                        ]);
+                    },
+                    Err(e) => {
+                        self.log(RichText::Color {
+                            text: e.to_string(),
+                            color: ap::TextColor::Red,
+                        });
+                    }
+                }
                 true
             },
 
@@ -529,7 +559,6 @@ impl Core {
         if !matches!(self.should_process_save_file, ShouldProcess::Ok) {
             self.log("Continuing with current save file");
             self.should_process_save_file = ShouldProcess::Ok;
-            log::info!("Locations {:?}", save_data.locations);
         }
         return true;
     }
@@ -576,6 +605,9 @@ impl Core {
         let Some(client) = self.client() else {
             return;
         };
+        let Ok(game_data_man) = (unsafe { GameDataMan::instance() }) else {
+            return;
+        };
         let Ok(item_man) = (unsafe { MapItemMan::instance_mut() }) else {
             return;
         };
@@ -595,19 +627,6 @@ impl Core {
             .iter()
             .find(|item| item.index() >= save_data.items_granted)
         {
-            // The NG+ trap isn't a real Elden Ring item, so it has no ER ID in
-            // the slot data. Handle it here, before that lookup.
-            if item
-                .item()
-                .name()
-                .eq_ignore_ascii_case(NG_PLUS_TRAP_ITEM_NAME)
-            {
-                save_data.items_granted += 1;
-                self.start_ng_trap(save_data);
-                self.last_item_time = Instant::now();
-                return;
-            }
-
             let source_location = item.location();
             let source_location_name = source_location.name().to_string();
             let id_key = I64Key(item.item().id());
@@ -635,7 +654,7 @@ impl Core {
             // items (location `-2: Server`). Granting this copy too would double
             // them up, so skip it if the player already has it.
             if source_location == ap::Location::server()
-                && has_item_in_inventory(er_id)
+                && has_item_in_inventory(game_data_man, er_id)
             {
                 info!(
                     "Skipping start-inventory item {} (ER ID {:?}) \
@@ -963,6 +982,16 @@ impl Core {
         let Ok(item_man) = (unsafe { MapItemMan::instance_mut() }) else {
             return Ok(());
         };
+        let Some(client) = self.client() else {
+          return Ok(());
+        };
+        if self.trap_items.is_empty() {
+            self.trap_items = TRAP_ITEM_NAMES.iter()
+                .flat_map(|&name| client.this_game().item_by_name(name)
+                    .and_then(|item| client.slot_data().ap_ids_to_item_ids.get(&I64Key(item.id())))
+                    .map(|item_id| (item_id.0, name.to_owned())))
+                .collect()
+        }
 
         // Collect into a separate vector so we aren't borrowing while we make
         // changes. Filtering during the walk keeps it to a handful of entries
@@ -975,17 +1004,25 @@ impl Core {
                 .items_data
                 .items()
                 .map(|e| e.item_id)
-                .filter(|id| id.is_archipelago())
+                .filter(|id| id.is_archipelago() || self.trap_items.contains_key(id))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
         for id in ids {
-            info!(
-                "Removing {} placeholder {:?}",
-                if id.is_local_archipelago() { "local" } else { "foreign" },
-                id
-            );
+            // Traps and AP items could be done in separate passes, but both are removed for the time being
+            match self.trap_items.get(&id) {
+                Some(name) if name == NG_PLUS_TRAP_ITEM_NAME => {
+                    self.start_ng_trap(save_data);
+                },
+                _ => {
+                    info!(
+                        "Removing {} placeholder {:?}",
+                        if id.is_local_archipelago() { "local" } else { "foreign" },
+                        id
+                    );
+                },
+            };
             game_data_man.remove_item(id, 1);
         }
 
@@ -1007,7 +1044,7 @@ impl Core {
         }
         self.locations_seen = save_data.locations.len();
 
-        if save_data.locations.len() > self.locations_sent
+        if save_data.locations.len() != self.locations_sent
             && let Some(client) = self.client_mut()
         {
             client.mark_checked(save_data.locations.iter().copied())?;
@@ -1286,12 +1323,23 @@ impl Core {
             player.apply_speffect(sp_effect, true);
         };
     }
+
+    fn remove_item_for_console(&self, name: &str) -> Result<()> {
+        let client = self.client().context("Client not connected")?;
+        let item = client.this_game().item_by_name(name)
+            .and_then(|item| client.slot_data().ap_ids_to_item_ids.get(&I64Key(item.id())))
+            .context("Unknown item name")?.0;
+        let game_data_man = unsafe { GameDataMan::instance_mut() }
+            .context("GameDataMan not loaded")?;
+        if !has_item_in_inventory(game_data_man, item) {
+            bail!("Item not found in inventory");
+        }
+        game_data_man.remove_item(item, 1);
+        Ok(())
+    }
 }
 
-fn has_item_in_inventory(item_id: ItemId) -> bool {
-    let Ok(game_data_man) = (unsafe { GameDataMan::instance() }) else {
-        return false;
-    };
+fn has_item_in_inventory(game_data_man: &GameDataMan, item_id: ItemId) -> bool {
     game_data_man
         .main_player_game_data
         .equipment
