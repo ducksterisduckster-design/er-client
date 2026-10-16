@@ -159,6 +159,8 @@ impl<G: Game, S: DeserializeOwned + Send + 'static> CoreBase<G, S> {
         self.config.set_death_link_enabled(death_link_enabled);
         self.config.save()?;
         self.connection = Self::new_connection(self.game, &self.config);
+        // The event buffer must be empty if not connected
+        self.event_buffer.clear();
         Ok(())
     }
 
