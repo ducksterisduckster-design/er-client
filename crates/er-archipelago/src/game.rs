@@ -2,7 +2,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use eldenring::cs::CSEventFlagMan;
+use eldenring::cs::{CSEventFlagMan, ChrInsExt};
 use eldenring::{
     cs::{
         CSFeManHudState, CSFeManImp, CSTaskGroupIndex, CSTaskImp, GameDataMan, MapItemMan, PlayerIns,
@@ -63,6 +63,9 @@ impl shared::Game for EldenRing {
                 return;
             }
 
+            // Save runes on death. This could be an option but it's hard to access here;
+            // it may be better to move all deathlink processing into `update_live`.
+            player.apply_speffect(4290, true);
             player.chr_ins.modules.data.hp = 0;
             *DEATH_LINK_KILL_AT.lock().unwrap() = Some(Instant::now());
         }
@@ -102,6 +105,7 @@ impl EldenRing {
     ///
     /// Call this on the main thread, with no other references to the game's
     /// internal state alive.
+    #[allow(unused)]
     pub unsafe fn death_debug() -> String {
         match unsafe { GameDataMan::instance() } {
             Ok(data) => format!("state {:?}, just died {}", data.death_state, data.just_died),
