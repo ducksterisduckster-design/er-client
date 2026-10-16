@@ -89,9 +89,6 @@ fn random_ng_raise() -> u32 {
     1 + (x % u64::from(MAX_NG_LEVEL)) as u32
 }
 
-/// The cause sent with, and shown for, a DeathLink when the local player dies.
-const DEATH_LINK_CAUSE: &str = "Elden Ring died";
-
 /// After a death is noticed, further deaths are ignored for this long. Death
 /// is spotted through several signals that don't all change on the same frame,
 /// and a real second death can't happen faster than the death screen and
@@ -684,42 +681,6 @@ impl Core {
         }
     }
 
-    /// Puts the game one NG+ cycle higher (capped at NG+7) until the player
-    /// dies. Does nothing if a trap is already active.
-    fn start_ng_trap(&mut self, save_data: &mut SaveData) {
-        if save_data.ng_trap.is_some() {
-            info!("NG+ trap received while one is already active; ignoring");
-            return;
-        }
-
-        let Some(original) = (unsafe { crate::game::EldenRing::ng_level() }) else {
-            warn!("NG+ trap received, but the game data isn't loaded; ignoring");
-            return;
-        };
-        let raise = random_ng_raise();
-        let trapped = (original + raise).min(MAX_NG_LEVEL);
-        if trapped == original {
-            info!("NG+ trap received, but the game is already on NG+{original}; ignoring");
-            return;
-        }
-        let actual_raise = trapped - original;
-
-        if unsafe { crate::game::EldenRing::set_ng_level(trapped) } {
-            info!(
-                "NG+ trap: NG+{original} -> NG+{trapped} (raised by {actual_raise}, rolled \
-                 {raise})"
-            );
-            save_data.ng_trap = Some(NgTrap { original, trapped });
-            let plural = if actual_raise == 1 { "" } else { "s" };
-            self.log(RichText::Color {
-                text: format!(
-                    "NG+ Trap! Raised {actual_raise} level{plural}, to NG+{trapped}, until you die."
-                ),
-                color: ap::TextColor::Red,
-            });
-        }
-    }
-
     /// Notices whether the local player died since the last tick. Uses every
     /// signal we have (the death flag, HP reaching zero, and the death count
     /// going up), since no single one has proven reliable on its own.
@@ -768,6 +729,80 @@ impl Core {
         );
         self.last_death_at = Some(Instant::now());
         true
+    }
+
+    /// Sends a DeathLink when the local player dies. Incoming DeathLinks are
+    /// handled in [shared::Core::take_events], which kills the player. Does
+    /// nothing unless DeathLink is enabled in the config.
+    fn handle_death_link(&mut self, died: bool) -> Result<()> {
+        if !died || !self.base().config().death_link_enabled() {
+            return Ok(());
+        }
+
+        // A death caused by someone else's DeathLink isn't ours to send back.
+        // Otherwise a single death would bounce between players forever.
+        if crate::game::EldenRing::take_death_link_kill() {
+            return Ok(());
+        }
+
+        let Some(client) = self.client_mut() else {
+            return Ok(());
+        };
+        // From network protocol: if cause is non-empty, it should contain the player name.
+        let msg = format!("{} died", client.this_player().alias());
+        self.log(vec![
+            RichText::Color {
+                text: "DeathLink: ".into(),
+                color: ap::TextColor::Red,
+            },
+            msg.clone().into(),
+        ]);
+
+        if let Some(client) = self.client_mut()
+            && let Err(err) =
+                client.death_link(ap::DeathLinkOptions::new().cause(msg))
+        {
+            // Not being able to send one isn't worth stopping the whole mod.
+            warn!("Failed to send DeathLink: {err:#}");
+        }
+
+        Ok(())
+    }
+
+    /// Puts the game one NG+ cycle higher (capped at NG+7) until the player
+    /// dies. Does nothing if a trap is already active.
+    fn start_ng_trap(&mut self, save_data: &mut SaveData) {
+        if save_data.ng_trap.is_some() {
+            info!("NG+ trap received while one is already active; ignoring");
+            return;
+        }
+
+        let Some(original) = (unsafe { crate::game::EldenRing::ng_level() }) else {
+            warn!("NG+ trap received, but the game data isn't loaded; ignoring");
+            return;
+        };
+        let raise = random_ng_raise();
+        let trapped = (original + raise).min(MAX_NG_LEVEL);
+        if trapped == original {
+            info!("NG+ trap received, but the game is already on NG+{original}; ignoring");
+            return;
+        }
+        let actual_raise = trapped - original;
+
+        if unsafe { crate::game::EldenRing::set_ng_level(trapped) } {
+            info!(
+                "NG+ trap: NG+{original} -> NG+{trapped} (raised by {actual_raise}, rolled \
+                 {raise})"
+            );
+            save_data.ng_trap = Some(NgTrap { original, trapped });
+            let plural = if actual_raise == 1 { "" } else { "s" };
+            self.log(RichText::Color {
+                text: format!(
+                    "NG+ Trap! Raised {actual_raise} level{plural}, to NG+{trapped}, until you die."
+                ),
+                color: ap::TextColor::Red,
+            });
+        }
     }
 
     /// While an NG+ trap is active, keeps the game on the trapped NG+ level,
@@ -1283,40 +1318,7 @@ impl Core {
         Ok(())
     }
 
-    /// Sends a DeathLink when the local player dies. Incoming DeathLinks are
-    /// handled in [shared::Core::take_events], which kills the player. Does
-    /// nothing unless DeathLink is enabled in the config.
-    fn handle_death_link(&mut self, died: bool) -> Result<()> {
-        if !died || !self.base().config().death_link_enabled() {
-            return Ok(());
-        }
-
-        // A death caused by someone else's DeathLink isn't ours to send back.
-        // Otherwise a single death would bounce between players forever.
-        if crate::game::EldenRing::take_death_link_kill() {
-            return Ok(());
-        }
-
-        self.log(vec![
-            RichText::Color {
-                text: "DeathLink: ".into(),
-                color: ap::TextColor::Red,
-            },
-            DEATH_LINK_CAUSE.to_string().into(),
-        ]);
-
-        if let Some(client) = self.client_mut()
-            && let Err(err) =
-                client.death_link(ap::DeathLinkOptions::new().cause(DEATH_LINK_CAUSE.to_string()))
-        {
-            // Not being able to send one isn't worth stopping the whole mod.
-            warn!("Failed to send DeathLink: {err:#}");
-        }
-
-        Ok(())
-    }
-
-    /// Applies speffect 81000001 which randomizer uses to confirm the client is connected.
+    /// Applies speffect which randomizer uses to confirm the client is connected.
     fn set_player_presence(&self, sp_effect: i32) {
         if let Ok(world_chr_man) = (unsafe { WorldChrMan::instance_mut() })
             && let Some(player) = world_chr_man.main_player.as_mut() {
