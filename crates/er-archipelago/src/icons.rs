@@ -3,7 +3,7 @@ use std::{ffi::c_void, fs, io::Read, sync::{Arc, Mutex, OnceLock}};
 use anyhow::Result;
 use fromsoftware_shared::{FromStatic, Program, singleton};
 use pelite::pe::Pe;
-use shared::utils;
+use shared::utils::{self, LazyFileReader};
 use windows::core::PCWSTR;
 use zip::ZipArchive;
 
@@ -33,34 +33,26 @@ struct TextureLoader {
 }
 
 impl TextureLoader {
-    /// Gets the loader if it exists, reading from icons.zip otherwise.
+    /// Gets the loader if it exists
     pub fn get() -> &'static Self {
-        static INSTANCE: OnceLock<Arc<TextureLoader>> = OnceLock::new();
-        INSTANCE.get_or_init(|| {
-            let loader = Arc::new(Self { load_queue: Mutex::new(vec![]) });
-            let other = loader.clone();
-            std::thread::spawn(move || {
-                other.load_files().expect("Failed to load icons.zip");
-            });
-            loader
-        })
+        static INSTANCE: OnceLock<TextureLoader> = OnceLock::new();
+        INSTANCE.get_or_init(|| Self { load_queue: Mutex::new(vec![]) })
     }
 
-    /// Enqueues textures distributed with the mod. This should only be done once.
+    /// Loads textures from icons.zip if it exists and adds any textures in the queue.
     /// This file could also be included as bytes but there is still a file component
     /// required for the layout file and they should be updated together.
-    fn load_files(&self) -> Result<()> {
-        let Ok(mod_dir) = utils::mod_directory() else {
-            return Ok(());
-        };
-        let mut icons_path = mod_dir.to_path_buf();
-        icons_path.push("icons.zip");
-        if !icons_path.exists() {
-            log::info!("Could not find {:?}", icons_path);
-            return Ok(());
+    fn load_textures(&self) {
+        static READER: LazyFileReader = LazyFileReader::new("icons.zip");
+        if let Some(data) = READER.take_data() {
+            self.read_icon_data(data).expect("Failed to load icons.zip");
         }
-        let zip_file = fs::File::open(icons_path)?;
-        let mut zip = ZipArchive::new(zip_file)?;
+        self.add_textures();
+    }
+
+    fn read_icon_data(&self, data: Vec<u8>) -> Result<()> {
+        let reader = std::io::Cursor::new(data);
+        let mut zip = ZipArchive::new(reader)?;
         let mut queue = self.load_queue.lock().unwrap();
         for i in 0..zip.len() {
             if let Ok(mut file) = zip.by_index(i)
@@ -75,12 +67,12 @@ impl TextureLoader {
         Ok(())
     }
 
-    /// Loads any textures in the queue.
-    pub fn load_textures(&self) {
+    fn add_textures(&self) {
         let mut queue = self.load_queue.lock().unwrap();
         if queue.is_empty() {
             return;
         }
+        // When is this present? It should be available much earlier than this can get called.
         let Ok(tpf_repo) = (unsafe { TpfRepository::instance_mut() }) else {
             return;
         };
@@ -107,6 +99,5 @@ impl TextureLoader {
                 );
             }
         }
-
     }
 }
