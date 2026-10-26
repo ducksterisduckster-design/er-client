@@ -1,0 +1,19 @@
+[[patterns]]
+pattern = "48 89 5C 24 ? 44 8B 49 ? 44 8B D2 33 D2 41 8B C2 41 F7 F1"
+captures = ["set_event_flag"]
+
+[[patterns]]
+pattern = "45 33 c9 48 89 44 ? ? 48 8d 54 ? ? 48 8b cb 45 8d 41 1e e8 $ { ' }"
+captures = ["", "set_event_value"]
+
+[[patterns]]
+pattern = "? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? ? 48 8b 41 60 48 85 c0 0f 84 ? ? ? ? 80 78 17 05"
+captures = ["buy_menu_gaitem"]
+
+[[patterns]]
+pattern = "44 8b 49 08 44 8b 41 04 0f b6 11 48 8b cb e8 $ { ' }"
+captures = ["", "get_shop_menu_list"]
+
+[[patterns]]
+pattern = "44 89 6c 24 28 44 88 64 24 20 4d 8b ce 4c 8b c7 48 8b d3 e8 $ { ' }"
+captures = ["", "load_tpf_res_cap"]

@@ -1,0 +1,689 @@
+#[cfg(feature = "profile")]
+use std::time::Duration;
+use std::time::Instant;
+use std::{marker::PhantomData, mem, ptr};
+
+use archipelago_rs::{self as ap, RichText, TextColor};
+use hudhook::RenderContext;
+use imgui::*;
+use imgui_sys::igSetWindowFocus_Str;
+use log::*;
+use regex_macro::regex;
+
+use crate::{Core, Game, prof};
+
+mod text_input_history;
+
+use text_input_history::TextInputHistory;
+
+/// The duration between debug prints of the frame timing data.
+#[cfg(feature = "profile")]
+const TIME_PER_FRAME_PRINT: Duration = Duration::from_secs(10);
+
+const GREEN: ImColor32 = ImColor32::from_rgb(0x8A, 0xE2, 0x43);
+const RED: ImColor32 = ImColor32::from_rgb(0xFF, 0x44, 0x44);
+const WHITE: ImColor32 = ImColor32::from_rgb(0xFF, 0xFF, 0xFF);
+// This is the darkest gray that still meets WCAG guidelines for contrast with
+// the black background of the overlay.
+const BLACK: ImColor32 = ImColor32::from_rgb(0x9C, 0x9C, 0x9C);
+const YELLOW: ImColor32 = ImColor32::from_rgb(0xFC, 0xE9, 0x4F);
+const BLUE: ImColor32 = ImColor32::from_rgb(0x82, 0xA9, 0xD4);
+const MAGENTA: ImColor32 = ImColor32::from_rgb(0xBF, 0x9B, 0xBC);
+const CYAN: ImColor32 = ImColor32::from_rgb(0x34, 0xE2, 0xE2);
+
+/// Treat small scroll/layout drift as still being at the bottom of the log.
+const LOG_SCROLL_BOTTOM_TOLERANCE: f32 = 48.0;
+
+/// File (in the mod's directory) where the overlay's own UI settings are kept
+/// between sessions. Plain `key=value` lines, so it needs no extra dependencies.
+const OVERLAY_SETTINGS_FILE: &str = "overlay_settings.txt";
+
+const DEFAULT_FONT_SCALE: f32 = 1.8;
+const DEFAULT_UNFOCUSED_OPACITY: f32 = 0.4;
+
+fn overlay_settings_path() -> Option<std::path::PathBuf> {
+    let dir = crate::utils::mod_directory().ok()?;
+    Some(dir.join(OVERLAY_SETTINGS_FILE))
+}
+
+/// Reads the saved font scale and unfocused opacity, if any. Missing or
+/// malformed values are returned as `None` so the defaults get used.
+fn load_overlay_settings() -> (Option<f32>, Option<f32>) {
+    let mut font_scale = None;
+    let mut opacity = None;
+    let Some(text) = overlay_settings_path().and_then(|p| std::fs::read_to_string(p).ok())
+    else {
+        return (font_scale, opacity);
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<f32>() else {
+            continue;
+        };
+        if !value.is_finite() {
+            continue;
+        }
+        match key.trim() {
+            "font_scale" => font_scale = Some(value.clamp(0.5, 4.0)),
+            "unfocused_window_opacity" => opacity = Some(value.clamp(0.0, 1.0)),
+            _ => {}
+        }
+    }
+    (font_scale, opacity)
+}
+
+fn save_overlay_settings(font_scale: f32, opacity: f32) {
+    let Some(path) = overlay_settings_path() else {
+        return;
+    };
+    let text = format!("font_scale={font_scale}\nunfocused_window_opacity={opacity}\n");
+    if let Err(e) = std::fs::write(&path, text) {
+        error!("Failed to save overlay settings to {path:?}: {e}");
+    }
+}
+
+/// The visual overlay that appears on top of the game.
+pub struct Overlay<G: Game> {
+    /// The last-known size of the viewport. This is only set once hudhook has
+    /// been initialized and the viewport has a non-zero size.
+    viewport_size: Option<[f32; 2]>,
+
+    /// The URL field in the modal connection popup.
+    popup_url: String,
+
+    /// The text the user typed in the say input.
+    say_input: String,
+
+    /// The history of messages sent to the say input.
+    say_history: TextInputHistory,
+
+    /// Whether the log was previously scrolled all the way down.
+    log_was_scrolled_down: bool,
+
+    /// The time of the most recent log we've seen. This is used to determine
+    /// when new logs are emitted for [frames_since_new_logs].
+    last_log_emitted: Instant,
+
+    /// The number of frames that have elapsed since new logs were last added.
+    /// We use this to determine when to auto-scroll the log window.
+    frames_since_new_logs: u64,
+
+    /// The current font scale for the overlay UI.
+    font_scale: f32,
+
+    /// The unfocused window opacity for the overlay UI.
+    unfocused_window_opacity: f32,
+
+    /// Whether the settings window is currently visible.
+    settings_window_visible: bool,
+
+    /// Whether the game was on the main menu in the previous frame.
+    was_main_menu: bool,
+
+    /// Whether the overlay window was focused in the previous frame.
+    was_window_focused: bool,
+
+    /// Whether compact mode was enabled in the previous frame.
+    was_compact_mode: bool,
+
+    /// Whether to focus the say input on the next frame. Used to keep focus
+    /// after the user pressed enter.
+    focus_say_input_next_frame: bool,
+
+    /// The size of the main overlay window in the previous frame. Used to
+    /// resize when entering and exiting compact mode.
+    previous_size: Option<[f32; 2]>,
+
+    /// The time the last profile data was printed.
+    #[cfg(feature = "profile")]
+    last_profile_printed: Instant,
+
+    /// This allows us to associate a [Game] with the overlay as a whole rather
+    /// than having to pass it to each method.
+    _marker: PhantomData<G>,
+}
+
+// Safety: The sole Overlay instance is owned by Hudhook, which only ever
+// interacts with it during frame rendering. We know the games' frame rendering
+// always happens on the main thread, and never in parallel, so synchronization
+// is not a real concern.
+unsafe impl<G: Game> Sync for Overlay<G> {}
+
+impl<G: Game> Overlay<G> {
+    /// Creates a new instance of the overlay and the core mod logic.
+    pub fn new() -> Self {
+        let (saved_font_scale, saved_opacity) = load_overlay_settings();
+        Self {
+            font_scale: saved_font_scale.unwrap_or(DEFAULT_FONT_SCALE),
+            unfocused_window_opacity: saved_opacity.unwrap_or(DEFAULT_UNFOCUSED_OPACITY),
+            was_compact_mode: true,
+
+            // Default values. We can't use [Default::default] because G doesn't
+            // require `Default`.
+            viewport_size: None,
+            popup_url: Default::default(),
+            say_input: Default::default(),
+            say_history: Default::default(),
+            log_was_scrolled_down: false,
+            last_log_emitted: Instant::now(),
+            frames_since_new_logs: 0,
+            settings_window_visible: false,
+            was_main_menu: false,
+            was_window_focused: false,
+            focus_say_input_next_frame: false,
+            previous_size: None,
+            #[cfg(feature = "profile")]
+            last_profile_printed: Instant::now(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Like [ImguiRenderLoop::render], but takes a reference to [Core] as well.
+    ///
+    /// We don't store `core` directly in the overlay so that we can ensure that
+    /// its mutex is only locked once per render.
+    pub fn render(&mut self, ui: &mut Ui, core: &mut G::Core) {
+        prof!(core.base_mut().profiler(), "AP overlay", {
+            prof!(core.base_mut().profiler(), "screen effect", {
+                self.render_screen_effect(ui, core);
+            });
+
+            prof!(core.base_mut().profiler(), "main window", {
+                self.render_main_window(ui, core);
+            });
+
+            prof!(core.base_mut().profiler(), "settings window", {
+                self.render_settings_window(ui, core);
+            });
+        });
+
+        #[cfg(feature = "profile")]
+        {
+            let now = Instant::now();
+            if now.duration_since(self.last_profile_printed) >= TIME_PER_FRAME_PRINT {
+                core.base_mut().profiler().report();
+                self.last_profile_printed = now;
+            }
+        }
+    }
+
+    fn render_screen_effect(&self, ui: &Ui, core: &G::Core) {
+        let Some(viewport_size) = self.viewport_size else {
+            return;
+        };
+        let Some(effect) = core.screen_effect() else {
+            return;
+        };
+
+        let opacity = effect.opacity.clamp(0.0, 1.0);
+        if opacity <= f32::EPSILON {
+            return;
+        }
+
+        ui.get_background_draw_list()
+            .add_rect(
+                [0.0, 0.0],
+                viewport_size,
+                ImColor32::from_rgba(
+                    effect.color[0],
+                    effect.color[1],
+                    effect.color[2],
+                    (opacity * 255.0).round() as u8,
+                ),
+            )
+            .filled(true)
+            .build();
+    }
+
+    /// See [ImguiRenderLoop::before_render], but takes a reference to [Core] as
+    /// well.
+    pub fn before_render<'a>(
+        &'a mut self,
+        ctx: &mut Context,
+        _render_context: &'a mut dyn RenderContext,
+    ) {
+        self.frames_since_new_logs += 1;
+        self.viewport_size = match ctx.main_viewport().size {
+            [0., 0.] => None,
+            size => Some(size),
+        };
+
+        // Set the font scale here because we need the frame height later to
+        // calculate the main window size, which depends on it.
+        ctx.io_mut().font_global_scale = self.font_scale;
+    }
+
+    /// Render the primary overlay window and any popups it opens.
+    fn render_main_window(&mut self, ui: &Ui, core: &mut G::Core) {
+        let Some(viewport_size) = self.viewport_size else {
+            return;
+        };
+
+        prof!(core.base_mut().profiler(), "set focus", {
+            // By default, imgui doesn't remove focus when escape is pressed,
+            // even though it does relinquish its claim to the mouse and
+            // keyboard. Because we use focus to determine when to make the
+            // overlay transparent, we want it to be removed more aggressivley,
+            // so we do so manually.
+            if ui.is_key_pressed(Key::Escape) ||
+                // Also defocus the window any time the player loads into the
+                // game. This ensures that controller players don't have to mess
+                // with the keyboard and mouse just to get the overlay
+                // unfocused.
+                (self.was_main_menu && unsafe { !G::is_main_menu() })
+            {
+                unsafe { igSetWindowFocus_Str(ptr::null()) };
+            }
+        });
+
+        let window_opacity = if self.was_window_focused {
+            1.0
+        } else {
+            self.unfocused_window_opacity
+        };
+        let mut bg_color = [0.0, 0.0, 0.0, window_opacity];
+        let _bg = ui.push_style_color(StyleColor::WindowBg, bg_color);
+        let _menu_bg = ui.push_style_color(StyleColor::MenuBarBg, bg_color);
+        bg_color[3] = 1.0; // Popup backgrounds should always be fully opaque.
+        let _popup_bg = ui.push_style_color(StyleColor::PopupBg, bg_color);
+
+        let mut builder = ui
+            .window(format!(
+                "Archipelago Client {} [{}]###ap-client-overlay",
+                G::CLIENT_VERSION,
+                match core.base().connection_state_type() {
+                    ap::ConnectionStateType::Connected => "Connected",
+                    ap::ConnectionStateType::Connecting => "Connecting...",
+                    ap::ConnectionStateType::Disconnected => "Disconnected",
+                }
+            ))
+            .position([viewport_size[0] - 30., 30.], Condition::FirstUseEver)
+            .position_pivot([1., 0.])
+            .menu_bar(true);
+
+        // When the menu opens or closes, add or remove space from the bottom of
+        // the overlay for the message bar and horizontal scrollbar.
+        let is_compact_mode = self.is_compact_mode(core);
+        builder = match (self.previous_size, is_compact_mode, self.was_compact_mode) {
+            (Some(size), true, false) => {
+                let style = ui.clone_style();
+                let remove_bottom_space =
+                    ui.frame_height() + style.window_padding[1] + style.scrollbar_size;
+
+                builder.size(
+                    [size[0], size[1] - remove_bottom_space.ceil()],
+                    Condition::Always,
+                )
+            }
+            (Some(size), false, true) => {
+                let style = ui.clone_style();
+                let add_bottom_space =
+                    ui.frame_height() + style.window_padding[1] + style.scrollbar_size;
+
+                builder.size(
+                    [size[0], size[1] + add_bottom_space.ceil()],
+                    Condition::Always,
+                )
+            }
+            _ => builder.size([viewport_size[0] * 0.4, 300.], Condition::FirstUseEver),
+        };
+
+        let focus_say_input = mem::take(&mut self.focus_say_input_next_frame);
+        let collapsed = builder
+            .build(|| {
+                prof!(core.base_mut().profiler(), "menu bar", {
+                    self.render_menu_bar(ui);
+                });
+
+                ui.separator();
+
+                prof!(core.base_mut().profiler(), "log window", {
+                    self.render_log_window(ui, core);
+                });
+
+                if !is_compact_mode {
+                    if core.base().is_disconnected() {
+                        prof!(core.base_mut().profiler(), "connection buttons", {
+                            self.render_connection_buttons(ui, core);
+                        });
+                    } else {
+                        prof!(core.base_mut().profiler(), "say input", {
+                            self.render_say_input(ui, core, focus_say_input);
+                        });
+                    }
+                }
+                prof!(core.base_mut().profiler(), "URL modal", {
+                    self.render_url_modal_popup(ui, core);
+                });
+
+                self.was_window_focused =
+                    ui.is_window_focused_with_flags(WindowFocusedFlags::ROOT_AND_CHILD_WINDOWS);
+                self.previous_size = Some(ui.window_size());
+            })
+            .is_none();
+
+        self.was_main_menu = unsafe { G::is_main_menu() };
+        self.was_compact_mode = is_compact_mode;
+
+        if collapsed {
+            self.was_window_focused = false;
+        }
+    }
+
+    /// Renders the modal popup which queries the player for connection
+    /// information.
+    fn render_url_modal_popup(&mut self, ui: &Ui, core: &mut G::Core) {
+        ui.modal_popup_config("#url-modal-popup")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .always_auto_resize(true)
+            .build(|| {
+                {
+                    let _item_width = ui.push_item_width(500. * self.font_scale);
+                    ui.input_text("Room URL", &mut self.popup_url)
+                        .hint("archipelago.gg:12345")
+                        .chars_noblank(true)
+                        .build();
+                }
+
+                ui.disabled(self.popup_url.is_empty(), || {
+                    if ui.button("Connect") {
+                        ui.close_current_popup();
+                        if let Err(e) = core.base_mut().update_url(&self.popup_url) {
+                            error!("Failed to save config: {e}");
+                        }
+                    }
+                });
+            });
+    }
+
+    /// Writes the font scale and unfocused opacity to disk.
+    fn save_settings(&self) {
+        save_overlay_settings(self.font_scale, self.unfocused_window_opacity);
+    }
+
+    /// Renders the menu bar.
+    fn render_menu_bar(&mut self, ui: &Ui) {
+        ui.menu_bar(|| {
+            if ui.menu_item("Settings") {
+                log::warn!("Click registered");
+                self.settings_window_visible = true;
+            }
+        });
+    }
+
+    /// Renders the settings popup.
+    fn render_settings_window(&mut self, ui: &Ui, core: &mut G::Core) {
+        if !self.settings_window_visible {
+            return;
+        }
+
+        let settings_bg_color = [0.0, 0.0, 0.0, 1.0];
+        let _bg = ui.push_style_color(StyleColor::WindowBg, settings_bg_color);
+
+        ui.window("Archipelago Overlay Settings")
+            .size([0., 0.], Condition::Appearing)
+            .position_pivot([0.5, 0.5])
+            .collapsible(false)
+            .build(|| {
+                ui.text("Font size ");
+                ui.same_line();
+                if ui.button("-##font-size-decrease-button") {
+                    self.font_scale = (self.font_scale - 0.1).max(0.5);
+                    self.save_settings();
+                }
+                ui.same_line();
+                if ui.button("+##font-size-increase-button") {
+                    self.font_scale = (self.font_scale + 0.1).min(4.0);
+                    self.save_settings();
+                }
+
+                let mut opacity_percent = (self.unfocused_window_opacity * 100.0).round() as i32;
+                let _slider_width = ui.push_item_width(150. * self.font_scale);
+                ui.text("Unfocused opacity ");
+                ui.same_line();
+                ui.slider_config("##unfocused-opacity-slider", 0, 100)
+                    .display_format("%d%%")
+                    .build(&mut opacity_percent);
+                self.unfocused_window_opacity = (opacity_percent as f32) / 100.0;
+                // Only write to disk once the slider is let go, not every frame
+                // while it's being dragged.
+                if ui.is_item_deactivated_after_edit() {
+                    self.save_settings();
+                }
+
+                if G::SUPPORTS_ITEM_POPUP_SETTING {
+                    let mut show_item_popups = core.base().show_item_popups();
+                    if ui.checkbox("Show incoming item popups", &mut show_item_popups)
+                        && let Err(e) = core.base_mut().update_show_item_popups(show_item_popups)
+                    {
+                        error!("Failed to save item popup setting: {e}");
+                    }
+
+                    if !show_item_popups {
+                        let mut show_progression_item_popups =
+                            core.base().show_progression_item_popups();
+                        if ui.checkbox(
+                            "Show popups for progression items",
+                            &mut show_progression_item_popups,
+                        ) && let Err(e) = core
+                            .base_mut()
+                            .update_show_progression_item_popups(show_progression_item_popups)
+                        {
+                            error!("Failed to save progression item popup setting: {e}");
+                        }
+                    }
+                }
+
+                let mut death_link_enabled = core.base().config().death_link_enabled();
+                if ui.checkbox("Enable DeathLink", &mut death_link_enabled)
+                    && let Err(e) = core.base_mut().update_death_link_enabled(death_link_enabled)
+                {
+                    error!("Failed to save deathlink setting: {e}");
+                }
+
+                if ui.button("Ok") {
+                    self.settings_window_visible = false;
+                }
+            });
+    }
+
+    /// Renders the buttons that allow the player to reconnect to Archipelago.
+    /// These take the place of the text box when the client is disconnected.
+    fn render_connection_buttons(&mut self, ui: &Ui, core: &mut G::Core) {
+        if ui.button("Reconnect") {
+            core.base_mut().reconnect();
+        }
+
+        ui.same_line();
+        if ui.button("Change URL") {
+            ui.open_popup("#url-modal-popup");
+            core.base().config().url().clone_into(&mut self.popup_url);
+        }
+    }
+
+    /// Renders the log window which displays all the prints sent from the server.
+    fn render_log_window(&mut self, ui: &Ui, core: &G::Core) {
+        let style = ui.clone_style();
+
+        let scrollbar_bg_opacity = if self.was_window_focused { 1.0 } else { 0.0 };
+        let scrollbar_bg_color = [0.0, 0.0, 0.0, scrollbar_bg_opacity];
+        let _scrollbar_bg = ui.push_style_color(StyleColor::ScrollbarBg, scrollbar_bg_color);
+
+        let _item_spacing = ui.push_style_var(StyleVar::ItemSpacing([
+            style.item_spacing[0],
+            style.window_padding[1],
+        ]));
+
+        let is_compact_mode = self.is_compact_mode(core);
+        let input_height = if !is_compact_mode {
+            ui.frame_height_with_spacing()
+        } else {
+            0.0
+        };
+
+        ui.child_window("#log")
+            .size([0.0, -input_height.ceil()])
+            .draw_background(false)
+            .always_vertical_scrollbar(true)
+            .always_horizontal_scrollbar(!is_compact_mode)
+            .build(|| {
+                if let Some((_, log_time)) = core.base().logs().last()
+                    && log_time > &self.last_log_emitted
+                {
+                    self.frames_since_new_logs = 0;
+                    self.last_log_emitted = *log_time;
+                }
+
+                let clipper = ListClipper::new(core.base().logs().len().try_into().unwrap());
+                let mut clip = clipper.begin(ui);
+                while clip.step() {
+                    for (message, _) in core
+                        .base()
+                        .logs()
+                        .skip(clip.display_start().try_into().unwrap_or(0))
+                        .take(
+                            (clip.display_end() - clip.display_start())
+                                .try_into()
+                                .unwrap_or(0),
+                        )
+                    {
+                        use ap::Print::*;
+                        write_message_data(
+                            ui,
+                            message.data(),
+                            // De-emphasize miscellaneous server prints.
+                            match message {
+                                Chat { .. }
+                                | ServerChat { .. }
+                                | Tutorial { .. }
+                                | CommandResult { .. }
+                                | AdminCommandResult { .. }
+                                | Unknown { .. } => 0xff,
+                                ItemSend { item, .. }
+                                | ItemCheat { item, .. }
+                                | Hint { item, .. }
+                                    if core.base().config().slot() == item.receiver().name()
+                                        || core.base().config().slot() == item.sender().name() =>
+                                {
+                                    0xFF
+                                }
+                                _ => 0xAA,
+                            },
+                        );
+                    }
+                }
+                let should_scroll_to_bottom =
+                    self.log_was_scrolled_down && self.frames_since_new_logs < 10;
+                if should_scroll_to_bottom {
+                    ui.set_scroll_y(ui.scroll_max_y());
+                }
+                self.log_was_scrolled_down = should_scroll_to_bottom || is_scrolled_to_bottom(ui);
+            });
+    }
+
+    /// Renders the text box in which users can write chats to the server.
+    ///
+    /// If `focus` is true, this forces the input to be in focus.
+    fn render_say_input(&mut self, ui: &Ui, core: &mut G::Core, focus: bool) {
+        ui.disabled(core.client().is_none(), || {
+            let arrow_button_width = ui.frame_height(); // Arrow buttons are square buttons.
+            let style = ui.clone_style();
+            let spacing = style.item_spacing[0] * self.font_scale * 0.7;
+
+            let input_width = ui.push_item_width(-(arrow_button_width + spacing));
+            if focus {
+                ui.set_keyboard_focus_here();
+            }
+            let mut send = ui
+                .input_text("##say-input", &mut self.say_input)
+                .enter_returns_true(true)
+                .callback(InputTextCallback::HISTORY, &mut self.say_history)
+                .build();
+            drop(input_width);
+
+            ui.same_line_with_spacing(0.0, spacing);
+            send = ui.arrow_button("##say-button", Direction::Right) || send;
+
+            if send {
+                // We don't have a great way to surface these errors, and
+                // they're non-fatal, so just ignore them.
+                let line = mem::take(&mut self.say_input);
+                self.say_history.add(line.clone());
+                self.say(line, core);
+                self.focus_say_input_next_frame = true;
+            }
+        });
+    }
+
+    /// Handles a command from the player, falling back to sending it to the
+    /// server.
+    fn say(&mut self, message: String, core: &mut G::Core) {
+        let Some(captures) = regex!("^(![^ ]+)( +)?(.*)?$").captures(message.trim()) else {
+            let _ = core.client_mut().unwrap().say(message);
+            return;
+        };
+
+        let command = captures.get(1).unwrap().as_str();
+        let arg = captures.get(3).map(|c| c.as_str());
+        if !core.handle_command(command, arg) {
+            let _ = core.client_mut().unwrap().say(message);
+        }
+    }
+
+    /// Returns whether the overlay is currently in "compact mode", where the
+    /// bottommost widgets are not rendered.
+    fn is_compact_mode(&self, core: &G::Core) -> bool {
+        // When the connection is inactive, always show the buttons to
+        // reconnect.
+        !core.base().is_disconnected() && unsafe { !G::is_menu_open() }
+    }
+}
+
+trait ImColor32Ext {
+    /// Returns a copy of [self] with its opacity overridden by [alpha].
+    fn with_alpha(&self, alpha: u8) -> ImColor32;
+}
+
+impl ImColor32Ext for ImColor32 {
+    fn with_alpha(&self, alpha: u8) -> ImColor32 {
+        ImColor32::from_bits((self.to_bits() & 0x00ffffff) | ((alpha as u32) << 24))
+    }
+}
+
+/// Writes the text in [parts] to [ui] in a single line.
+fn write_message_data(ui: &Ui, parts: &[RichText], alpha: u8) {
+    let mut first = true;
+    for part in parts {
+        if !first {
+            ui.same_line();
+        }
+        first = false;
+
+        // TODO: Load in fonts to support bold, maybe write a line manually for
+        // underline? I'm not sure there's a reasonable way to support
+        // background colors.
+        use RichText::*;
+        use TextColor::*;
+        let color = match part {
+            Player { .. } | PlayerName { .. } | Color { color: Blue, .. } => BLUE,
+            Item { .. } | Color { color: Magenta, .. } => MAGENTA,
+            Location { .. } | EntranceName { .. } | Color { color: Cyan, .. } => CYAN,
+            Color { color: Black, .. } => BLACK,
+            Color { color: Red, .. } => RED,
+            Color { color: Green, .. } => GREEN,
+            Color { color: Yellow, .. } => YELLOW,
+            _ => WHITE,
+        };
+        // TODO: This causes significant issues for multi-line messages like !license
+        // as they prevent scrolling down without flickering.
+        ui.text_colored(color.with_alpha(alpha).to_rgba_f32s(), part.to_string());
+    }
+}
+
+fn is_scrolled_to_bottom(ui: &Ui) -> bool {
+    (ui.scroll_max_y() - ui.scroll_y()).abs() <= LOG_SCROLL_BOTTOM_TOLERANCE
+}

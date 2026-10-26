@@ -1,0 +1,37 @@
+[package]
+name = "er-archipelago"
+version = "0.1.3"
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+readme = false
+
+[lib]
+crate-type = ["cdylib"]
+name = "er_archipelago"
+
+[dependencies]
+anyhow.workspace = true
+archipelago_rs.workspace = true
+bincode.workspace = true
+eldenring = { git = "https://github.com/ducksterisduckster-design/fromsoft-rs" }
+eldenring-extra = { git = "https://github.com/ducksterisduckster-design/fromsoft-extra" }
+fastrand = "2.5.0"
+fromsoftware-shared = { git = "https://github.com/ducksterisduckster-design/fromsoft-rs" }
+hudhook.workspace = true
+ilhook.workspace = true
+json.workspace = true
+log.workspace = true
+pelite.workspace = true
+prost = "0.14.4"
+regex-macro.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_repr.workspace = true
+shared.workspace = true
+windows.workspace = true
+zip = "9.0.0"
+
+[features]
+# Enable runtime profiling
+profile = ["shared/profile"]

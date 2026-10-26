@@ -1,0 +1,1498 @@
+use std::{
+    collections::{HashMap, HashSet}, matches, str::FromStr, time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
+use archipelago_rs as ap;
+use archipelago_rs::RichText;
+use eldenring::cs::*;
+use eldenring::param::EquipParamStructMut;
+use fromsoftware_shared::FromStatic;
+use log::*;
+use regex_macro::regex;
+
+use crate::{checks, game::status};
+use crate::checks::{LocationFlagChanges, LocationFlagMapping};
+use crate::dungeon_sweep::DungeonSweep;
+use crate::item::{ItemIdExt, RegulationManager};
+use crate::save_data::*;
+use crate::slot_data::{EventFlagId, I64Key, SlotData};
+use shared::{Core as SharedCore, CoreBase};
+
+const RECEIVED_ITEM_GRANT_INTERVAL: Duration = Duration::from_millis(33);
+const ITEM_GET_DISPLAY_SUPPRESSION_DURATION: Duration = Duration::from_millis(75);
+
+/// How many locations `poll_flag_based_checks` looks at per frame.
+///
+/// There are ~5000 flag-backed locations and reading a flag isn't free
+/// (but is currently unnecessarily very inefficient). At this batch size
+/// the whole table gets swept in ~1.3s at 60fps, which is acceptable for
+/// anything missed by the flag hooks.
+const FLAG_POLL_BATCH_SIZE: usize = 64;
+
+/// How often the inventory is swept for placeholder items. The sweep walks
+/// every carried item, and a placeholder can wait a few frames before it's
+/// handled.
+const INVENTORY_SCAN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the virtual-location passes (expansion, local grants, foreign
+/// notifications) run when no new location has been checked. They also run
+/// right away whenever the checked set changes, so this is just a backstop for
+/// state that changed elsewhere (like a late server connection).
+const VIRTUAL_LOCATION_SYNC_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long to wait for the server's answer to the location scout before asking
+/// again. Without this, an answer that never arrives would block every
+/// by-location grant for the whole session.
+const LOCAL_ITEM_SCOUT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Max allowed IGT for initializing Archipelago in a save file without
+/// player confirmation to avoid immediate item spam.
+const NEW_SAVE_FILE_INIT_PERIOD: Duration = Duration::from_secs(60);
+
+/// The grace period between MapItemMan starting to exist and the mod beginning
+/// to take actions.
+const LOAD_GRACE_PERIOD: Duration = Duration::from_secs(6);
+
+/// Speffect to apply always to indicate the client is present.
+/// This should be set within a second of event scripts starting to run.
+const LOADED_SPEFFECT: i32 = 81000001;
+
+/// Speffect to apply if all processing is being successfully completely.
+const PROCESSING_SPEFFECT: i32 = 81000002;
+
+/// Archipelago item name of NG+ Trap
+const NG_PLUS_TRAP_ITEM_NAME: &str = "NG+ Trap";
+
+/// The highest NG+ scaling level the game has.
+const MAX_NG_LEVEL: u32 = 7;
+
+/// Archipelago item name of Status Trap
+const STATUS_TRAP_ITEM_NAME: &str = "Status Trap";
+
+const STATUS_TRAP_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// All Archipelago trap names.
+const TRAP_ITEM_NAMES: [&str; 2] = [NG_PLUS_TRAP_ITEM_NAME, STATUS_TRAP_ITEM_NAME];
+
+/// After a death is noticed, further deaths are ignored for this long. Death
+/// is spotted through several signals that don't all change on the same frame,
+/// and a real second death can't happen faster than the death screen and
+/// respawn allow.
+const DEATH_COOLDOWN: Duration = Duration::from_secs(30);
+
+
+/// Checks an outstanding location scout and returns the result once the server
+/// has answered. Boxed so this file doesn't have to name the Archipelago
+/// client's channel type.
+type ScoutPoll = Box<dyn FnMut() -> Option<Result<Vec<ap::LocatedItem>, ap::Error>> + Send>;
+
+/// The core of the Archipelago mod. Runs the non-UI game logic and talks to the
+/// Archipelago client.
+pub struct Core {
+    /// The cross-game core.
+    base: CoreBase<crate::game::EldenRing, SlotData>,
+
+    /// State for whether to perform core processing because the player has loaded
+    /// into a preexisting save file, to prevent spamming local and external items.
+    should_process_save_file: ShouldProcess,
+
+    /// When we last granted an item to the player. Used to throttle bursts of
+    /// incoming items without making release queues take minutes to drain.
+    last_item_time: Instant,
+
+    /// How many locations we've sent to the server this session. Starts at 0 on
+    /// every boot, so we resend anything that might have been missed.
+    locations_sent: usize,
+
+    /// Whether the player has reached their goal and we've told the server.
+    /// Kept here instead of in the save data so it's resent on every launch, in
+    /// case it got lost.
+    sent_goal: bool,
+
+    /// Item display param rows that are suppressed for incoming Archipelago
+    /// grants and need to be restored later.
+    item_get_display_restores: Vec<ItemGetDisplayRestore>,
+
+    /// Two-way mapping between Archipelago locations and event flags, used for
+    /// flag-based check detection (item lots and shop purchases that never
+    /// touch the inventory). Built the first time the regulation is available.
+    /// It doesn't change for the rest of the session.
+    location_flag_mapping: Option<LocationFlagMapping>,
+
+    /// Locations still waiting to be seen as checked for poll-based location
+    /// checking, populated when `location_flag_mapping` is set.
+    pending_flag_checks: Vec<i64>,
+
+    /// How far through `pending_flag_checks` the current sweep has got.
+    flag_poll_cursor: usize,
+
+    /// Shop locations whose hints have been sent to the server (or attempted).
+    /// This persists even with save data changes but can be sent again on restart.
+    hinted_locations: HashSet<i64>,
+
+    /// Timers for the periodic sync passes, so they don't run every frame.
+    last_inventory_scan: Option<Instant>,
+    last_virtual_location_sync: Option<Instant>,
+
+    /// How many locations were checked at the end of the last tick. Used to
+    /// notice when a new one comes in.
+    locations_seen: usize,
+
+    /// Whether the local player was dead as of the last tick.
+    was_dead: bool,
+
+    /// The player's death count as of the last tick, or `None` while not in a
+    /// game. One of the ways [Core::detect_death] notices a death.
+    last_death_count: Option<u32>,
+
+    /// [SaveData::menu_returns] as of the last death check, so we can tell
+    /// when the death count we remember belongs to a different session.
+    last_menu_returns: u32,
+
+    /// When the last death was noticed. See [DEATH_COOLDOWN].
+    last_death_at: Option<Instant>,
+
+    /// Mapping from a trap's item to the apworld item name, which is used to
+    /// trigger it and then remove it from inventory.
+    trap_items: HashMap<ItemId, String>,
+
+    /// The NG+ level a trap just restored, waiting to be announced once the
+    /// player has respawned (the overlay only keeps a message for a few
+    /// seconds, and the death and loading screens can use them all up).
+    ng_trap_restored: Option<u32>,
+
+    last_status_trap_at: Instant,
+
+    /// The pending request asking the server which item sits at each of this
+    /// game's locations, and when we sent it.
+    local_item_scout: Option<ScoutPoll>,
+    local_item_scout_requested: Option<Instant>,
+
+    /// Location ID to Archipelago item ID, for every location holding one of
+    /// this player's *own* items. `None` until the server has answered the
+    /// scout. Locations with another player's item aren't listed, so those stay
+    /// placeholders.
+    local_location_items: Option<HashMap<i64, i64>>,
+
+    /// Dungeon Sweep state, and the [SaveData::menu_returns] it last saw so it
+    /// starts over when a different save is loaded.
+    dungeon_sweep: DungeonSweep,
+    dungeon_sweep_menu_returns: u32,
+}
+
+/// Interactive state for allowing processing or not.
+enum ShouldProcess {
+    /// Default state
+    Ok,
+    /// Player has to confirm to start processing
+    AwaitingConfirmation,
+    // Player confirmed and can move to Ok
+    Confirmed,
+}
+
+struct LocalVirtualItemGrant {
+    location_id: i64,
+    location_name: String,
+    ap_item_id: i64,
+    item_name: String,
+    er_id: ItemId,
+    quantity: u32,
+}
+
+impl shared::Core for Core {
+    type SlotData = SlotData;
+    type Game = crate::game::EldenRing;
+
+    /// Creates a new instance of the mod.
+    fn new() -> Result<Self> {
+        let now = Instant::now();
+        Ok(Self {
+            base: CoreBase::new("EldenRing")?,
+            should_process_save_file: ShouldProcess::Ok,
+            last_item_time: now,
+            locations_sent: 0,
+            sent_goal: false,
+            item_get_display_restores: Vec::new(),
+            location_flag_mapping: None,
+            pending_flag_checks: Vec::new(),
+            flag_poll_cursor: 0,
+            hinted_locations: HashSet::new(),
+            last_inventory_scan: None,
+            last_virtual_location_sync: None,
+            locations_seen: 0,
+            was_dead: false,
+            last_death_count: None,
+            last_menu_returns: 0,
+            last_death_at: None,
+            trap_items: HashMap::new(),
+            ng_trap_restored: None,
+            last_status_trap_at: now,
+            local_item_scout: None,
+            local_item_scout_requested: None,
+            local_location_items: None,
+            dungeon_sweep: DungeonSweep::default(),
+            dungeon_sweep_menu_returns: 0,
+        })
+    }
+
+    fn base(&self) -> &CoreBase<Self::Game, SlotData> {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut CoreBase<Self::Game, SlotData> {
+        &mut self.base
+    }
+
+    /// Updates the game logic and checks for common errors. Does nothing if
+    /// we're not connected to the server or the mod hit a fatal error.
+    fn update_live(&mut self) -> Result<()> {
+        self.set_player_presence(LOADED_SPEFFECT);
+        crate::icons::load_tpf();
+        if !self.base().past_grace_period(LOAD_GRACE_PERIOD) {
+            return Ok(());
+        }
+
+        self.check_seed_slot_conflict()?;
+        if !self.check_save_valid() {
+            // Not a fatal error but prevents further processing
+            return Ok(());
+        }
+        
+        self.restore_expired_item_get_displays();
+
+        // Handle events that should only happen while the player has a save
+        // loaded and is playing.
+        self.take_events();
+
+        self.process_incoming_items();
+        self.process_inventory_items()?;
+        self.handle_goal()?;
+        let died = self.detect_death();
+        self.handle_death_link(died)?;
+        self.handle_ng_trap(died);
+        self.set_player_presence(PROCESSING_SPEFFECT);
+
+        Ok(())
+    }
+
+    fn handle_command(&mut self, command: &str, arg: Option<&str>) -> bool {
+        let mut arg_error = |usage: &str| {
+            self.log(vec![
+                RichText::Color {
+                    text: format!("Invalid {}.", command),
+                    color: ap::TextColor::Red,
+                },
+                " Usage:\n".into(),
+                usage.into(),
+            ]);
+        };
+
+        match command {
+            "!getevent" => {
+                let Some(flag) = arg.and_then(|f| u32::from_str(f).ok()) else {
+                    arg_error("!getevent EVENT_FLAG");
+                    return true;
+                };
+
+                let Some(value) = get_event_flag(EventFlagId(flag)) else {
+                    self.log(RichText::Color {
+                        text: "CSEventFlagMan not loaded".into(),
+                        color: ap::TextColor::Red,
+                    });
+                    return true;
+                };
+
+                self.log(vec![
+                    "Event ".into(),
+                    RichText::Color {
+                        text: format!("{:?}", flag),
+                        color: ap::TextColor::Blue,
+                    },
+                    ": ".into(),
+                    RichText::Color {
+                        text: format!("{:?}", value),
+                        color: if value {
+                            ap::TextColor::Green
+                        } else {
+                            ap::TextColor::Red
+                        },
+                    },
+                ]);
+
+                true
+            }
+
+            "!ngstatus" => {
+                let level = unsafe { crate::game::EldenRing::ng_level() };
+                let deaths = unsafe { crate::game::EldenRing::death_count() };
+                self.log(RichText::Color {
+                    text: format!(
+                        "NG level: {}, deaths: {}",
+                        level.map_or("?".to_string(), |n| n.to_string()),
+                        deaths.map_or("?".to_string(), |n| n.to_string())
+                    ),
+                    color: ap::TextColor::Blue,
+                });
+                true
+            }
+
+            "!ngtrap" => {
+                if let Some(save_data) = SaveData::instance_mut().as_mut() {
+                    self.start_ng_trap(save_data);
+                }
+                true
+            }
+
+            "!setevent" => {
+                let Some((flag, value)) = arg.and_then(|a| {
+                    let args = regex!(" +").split(a).collect::<Vec<_>>();
+                    if args.len() == 2 {
+                        Some((u32::from_str(args[0]).ok()?, bool::from_str(args[1]).ok()?))
+                    } else {
+                        None
+                    }
+                }) else {
+                    arg_error("!setevent EVENT_FLAG BOOL");
+                    return true;
+                };
+
+                if !set_event_flag(EventFlagId(flag), value) {
+                    self.log(RichText::Color {
+                        text: "CSEventFlagMan not loaded".into(),
+                        color: ap::TextColor::Red,
+                    });
+                    return true;
+                };
+
+                self.log(vec![
+                    "Set event ".into(),
+                    RichText::Color {
+                        text: format!("{:?}", flag),
+                        color: ap::TextColor::Blue,
+                    },
+                    " to ".into(),
+                    RichText::Color {
+                        text: format!("{:?}", value),
+                        color: if value {
+                            ap::TextColor::Green
+                        } else {
+                            ap::TextColor::Red
+                        },
+                    },
+                ]);
+
+                true
+            },
+
+            "!removeitem" => {
+                let Some(name) = arg else {
+                    arg_error("!removeitem ITEM NAME");
+                    return true;
+                };
+                match self.remove_item_for_console(name) {
+                    Ok(_) => {
+                        self.log(vec![
+                            "Removed ".into(),
+                            RichText::Color {
+                                text: name.into(),
+                                color: ap::TextColor::Blue,
+                            },
+                        ]);
+                    },
+                    Err(e) => {
+                        self.log(RichText::Color {
+                            text: e.to_string(),
+                            color: ap::TextColor::Red,
+                        });
+                    }
+                }
+                true
+            },
+
+            "!applysp" => {
+                let Some(sp_effect) = arg.and_then(|f| i32::from_str(f).ok()) else {
+                    arg_error("!applysp SP_EFFECT");
+                    return true;
+                };
+                self.set_player_presence(sp_effect);
+                self.log(vec![
+                    "Applied ".into(),
+                    RichText::Color {
+                        text: format!("{:?}", sp_effect),
+                        color: ap::TextColor::Blue,
+                    },
+                ]);
+                true
+            }
+
+            "!sweep" => {
+                // No argument toggles; `on` / `off` set it explicitly.
+                let target = match arg.map(|a| a.trim().to_ascii_lowercase()).as_deref() {
+                    None | Some("") => !self.dungeon_sweep_enabled(),
+                    Some("on") => true,
+                    Some("off") => false,
+                    Some(_) => {
+                        self.log(vec![
+                            RichText::Color {
+                                text: "Invalid !sweep.".into(),
+                                color: ap::TextColor::Red,
+                            },
+                            " Usage:\n".into(),
+                            "!sweep [on|off]".into(),
+                        ]);
+                        return true;
+                    }
+                };
+                self.dungeon_sweep.set_override(target);
+                let state = if target { "enabled" } else { "disabled" };
+                self.log(vec![
+                    "Dungeon Sweep is now ".into(),
+                    RichText::Color {
+                        text: state.to_string(),
+                        color: if target {
+                            ap::TextColor::Green
+                        } else {
+                            ap::TextColor::Red
+                        },
+                    },
+                    ".".into(),
+                ]);
+                true
+            }
+
+            "!uisweep" => {
+                // Shows or hides the Dungeon Sweep chat message. Sweeping itself
+                // is unaffected, use `!sweep` for that.
+                let shown = self.dungeon_sweep.toggle_announce();
+                let state = if shown { "shown" } else { "hidden" };
+                self.log(vec![
+                    "Dungeon Sweep messages are now ".into(),
+                    RichText::Color {
+                        text: state.to_string(),
+                        color: if shown {
+                            ap::TextColor::Green
+                        } else {
+                            ap::TextColor::Red
+                        },
+                    },
+                    ".".into(),
+                ]);
+                true
+            }
+
+            "!overridesave" => {
+                if matches!(self.should_process_save_file, ShouldProcess::AwaitingConfirmation) {
+                    self.should_process_save_file = ShouldProcess::Confirmed;
+                }
+                true
+            },
+
+            _ => false,
+        }
+    }
+
+    fn screen_effect(&self) -> Option<shared::ScreenEffect> {
+        None
+    }
+}
+
+impl Core {
+    /// Errors if the server, the save and/or the config disagree about the
+    /// current seed. If the save has no seed yet, fills it in from what's
+    /// available.
+    fn check_seed_slot_conflict(&mut self) -> Result<()> {
+        let client_seed = self.client().map(|c| c.seed_name());
+        let client_slot = self.client().map(|c| c.this_player().slot());
+        let save = SaveData::instance();
+        let save_seed = save.as_ref().and_then(|s| s.seed.as_ref());
+        let save_slot = save.as_ref().and_then(|s| s.slot);
+
+        match (client_seed, save_seed) {
+            (Some(client_seed), _) if client_seed != self.seed() => bail!(
+                "You've connected to a different Archipelago multiworld than the one that \
+                EldenRingArchipelagoRandomizer.exe used!\n\
+                \n\
+                Connected room seed: {}\n\
+                EldenRingArchipelagoRandomizer.exe seed: {}",
+                client_seed,
+                self.seed()
+            ),
+            (Some(client_seed), Some(save_seed)) if client_seed != save_seed => bail!(
+                "You've connected to a different Archipelago multiworld than the one that \
+                 you used before with this save!\n\
+                 \n\
+                Connected room seed: {}\n\
+                Save file seed: {}",
+                client_seed,
+                save_seed
+            ),
+            (_, Some(save_seed)) if self.seed() != save_seed => bail!(
+                "Your most recent EldenRingArchipelagoRandomizer.exe invocation connected to a \
+                different Archipealgo multiworld than the one that you used before with this \
+                save!\n\
+                \n\
+                EldenRingArchipelagoRandomizer.exe seed: {}\n\
+                Save file seed: {}",
+                self.seed(),
+                save_seed
+            ),
+            _ => Ok(()),
+        }.and_then(|_| {
+            // Seed is correct so make one more check for slot if both are present.
+            // To go even further, validate the room is correct, which requires data storage.
+            match (client_slot, save_slot) {
+                // For better error message, show slot name, but this is reasonably usable still.
+                (Some(client_slot), Some(save_slot)) if client_slot != save_slot => bail!(
+                    "You've connected to a different Archipelago multiworld slot than the one that \
+                    you used before with this save!\n\
+                    \n\
+                    Connected room slot number: {}\n\
+                    Save file slot number: {}",
+                    client_slot,
+                    save_slot),
+                _ => Ok(()),
+            }
+        })
+
+    }
+
+    fn check_save_valid(&mut self) -> bool {
+        let Some(mut save_data) = SaveData::instance_mut() else {
+            return false;
+        };
+        if save_data.seed.is_none()
+        {
+            if self.should_init_save_file() {
+                info!("Initializing save file with {}", self.seed());
+                save_data.seed = Some(self.seed().to_owned());
+            } else {
+                return false;
+            }
+        }
+        if save_data.slot.is_none()
+            && let Some(client_slot) = self.client().map(|c| c.this_player().slot()) {
+            save_data.slot = Some(client_slot);
+        }
+        // If not OK, we previously showed an error message, so indicate things are fine now,
+        // either because of !overridesave or because of loading the correct save file.
+        if !matches!(self.should_process_save_file, ShouldProcess::Ok) {
+            self.log("Continuing with current save file");
+            self.should_process_save_file = ShouldProcess::Ok;
+        }
+        return true;
+    }
+    
+    /// Game check for whether the save file can be safely initialized with Archipelago data.
+    fn should_init_save_file(&mut self) -> bool {
+        if matches!(self.should_process_save_file, ShouldProcess::Confirmed) {
+            return true;
+        }
+        let newly_created = unsafe { GameDataMan::instance() }
+            .map(|game_data_man| Duration::from_millis(game_data_man.play_time.into()) < NEW_SAVE_FILE_INIT_PERIOD)
+            .unwrap_or(false);
+        if newly_created {
+            return true;
+        }
+        if matches!(self.should_process_save_file, ShouldProcess::Ok) {
+            self.log(RichText::Color {
+                text: "Error: Loaded into Elden Ring with a save file which wasn't created with the client active.".into(),
+                color: ap::TextColor::Red,
+            });
+            self.log(RichText::Color {
+                text: "If you loaded into the wrong save file: Create a new save file or switch to the correct save file.".into(),
+                color: ap::TextColor::Red,
+            });
+            self.log(RichText::Color {
+                text: "If you want to use this save file anyway: Type !overridesave to confirm.".into(),
+                color: ap::TextColor::Red,
+            });
+            self.log(RichText::Color {
+                // If need be, we can show the received item index and compute the location list just for this.
+                text: "(Warning: This may resend ALL items you've ever picked up or received from other players!)".into(),
+                color: ap::TextColor::Red,
+            });
+            self.should_process_save_file = ShouldProcess::AwaitingConfirmation;
+        }
+        return false;
+    }
+
+    /// Hands new items to the player when appropriate. Also sets up the
+    /// [SaveData] for a new file.
+    fn process_incoming_items(&mut self) {
+        let show_item_popups = self.base().show_item_popups();
+        let show_progression_item_popups = self.base().show_progression_item_popups();
+        let Some(client) = self.client() else {
+            return;
+        };
+        let Ok(game_data_man) = (unsafe { GameDataMan::instance() }) else {
+            return;
+        };
+        let Ok(item_man) = (unsafe { MapItemMan::instance_mut() }) else {
+            return;
+        };
+        let mut save_data = SaveData::instance_mut();
+        let Some(save_data) = save_data.as_mut() else {
+            return;
+        };
+
+        // Don't grant several received items in one burst, but keep release
+        // queues moving at a decent pace.
+        if self.last_item_time.elapsed() < RECEIVED_ITEM_GRANT_INTERVAL {
+            return;
+        }
+
+        if let Some(item) = client
+            .received_items()
+            .iter()
+            .find(|item| item.index() >= save_data.items_granted)
+        {
+            let source_location = item.location();
+            let source_location_name = source_location.name().to_string();
+            let id_key = I64Key(item.item().id());
+            let er_id = client
+                .slot_data()
+                .ap_ids_to_item_ids
+                .get(&id_key)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Archipelago item {:?} should have an ER ID defined in slot data",
+                        item.item()
+                    )
+                })
+                .0;
+            let quantity = client
+                .slot_data()
+                .item_counts
+                .get(&id_key)
+                .copied()
+                .unwrap_or(1);
+
+            // The randomizer puts some starting items in the player's inventory
+            // if they need to be set up in a particular with (like event flags),
+            // so they do not need to be granted as ordinary AP start-inventory
+            // items (location `-2: Server`). Granting this copy too would double
+            // them up, so skip it if the player already has it.
+            if source_location == ap::Location::server()
+                && has_item_in_inventory(game_data_man, er_id)
+            {
+                info!(
+                    "Skipping start-inventory item {} (ER ID {:?}) \
+                     already granted by the randomizer",
+                    item.item().name(),
+                    er_id
+                );
+                save_data.items_granted += 1;
+                self.last_item_time = Instant::now();
+                return;
+            }
+
+            info!(
+                "Granting {} (AP ID {}, ER ID {:?} from {})",
+                item.item().name(),
+                item.item().id(),
+                er_id,
+                source_location_name
+            );
+
+            let show_item_popup = show_item_popups
+                || (show_progression_item_popups && (item.is_progression() || item.is_useful()));
+            self.grant_received_item(item_man, er_id, quantity, show_item_popup);
+
+            save_data.items_granted += 1;
+            self.last_item_time = Instant::now();
+        }
+    }
+
+    /// Notices whether the local player died since the last tick. Uses every
+    /// signal we have (the death flag, HP reaching zero, and the death count
+    /// going up), since no single one has proven reliable on its own.
+    fn detect_death(&mut self) -> bool {
+        // While we're not in a game (the main menu, and possibly loading
+        // screens) leave what we know alone. The death count can go up during
+        // the respawn load, and we want to notice that once we're back.
+        if SaveData::instance().is_none() {
+            return false;
+        }
+
+        // Going back to the main menu ends the session, so the death count we
+        // remember may belong to another character. Start over instead of
+        // mistaking the difference for a death.
+        let menu_returns = SaveData::menu_returns();
+        if menu_returns != self.last_menu_returns {
+            self.last_menu_returns = menu_returns;
+            self.was_dead = false;
+            self.last_death_count = None;
+        }
+
+        let is_dead = unsafe { crate::game::EldenRing::is_player_dead() };
+        let death_count = unsafe { crate::game::EldenRing::death_count() };
+        let flag_came_on = is_dead && !self.was_dead;
+        let count_went_up = matches!(
+            (death_count, self.last_death_count),
+            (Some(now), Some(before)) if now > before
+        );
+        let previous_death_count = self.last_death_count;
+        self.was_dead = is_dead;
+        self.last_death_count = death_count;
+
+        if !(flag_came_on || count_went_up) {
+            return false;
+        }
+        if self
+            .last_death_at
+            .is_some_and(|at| at.elapsed() < DEATH_COOLDOWN)
+        {
+            return false;
+        }
+
+        info!(
+            "Player death detected (dead: {is_dead}, came on: {flag_came_on}, \
+             death count: {previous_death_count:?} -> {death_count:?})"
+        );
+        self.last_death_at = Some(Instant::now());
+        true
+    }
+
+    /// Sends a DeathLink when the local player dies. Incoming DeathLinks are
+    /// handled in [shared::Core::take_events], which kills the player. Does
+    /// nothing unless DeathLink is enabled in the config.
+    fn handle_death_link(&mut self, died: bool) -> Result<()> {
+        if !died || !self.base().config().death_link_enabled() {
+            return Ok(());
+        }
+
+        // A death caused by someone else's DeathLink isn't ours to send back.
+        // Otherwise a single death would bounce between players forever.
+        if crate::game::EldenRing::take_death_link_kill() {
+            return Ok(());
+        }
+
+        let Some(client) = self.client() else {
+            return Ok(());
+        };
+        // From network protocol: if cause is non-empty, it should contain the player name.
+        let game_cause = unsafe { crate::game::EldenRing::get_death_cause(client.this_player().alias()) };
+        let console_msg = game_cause.clone().unwrap_or_else(|| format!("{} died", client.this_player().alias()));
+        self.log(vec![
+            RichText::Color {
+                text: "DeathLink: ".into(),
+                color: ap::TextColor::Red,
+            },
+            console_msg.into(),
+        ]);
+
+        let mut options = ap::DeathLinkOptions::new();
+        if let Some(cause) = game_cause {
+            options = options.cause(cause);
+        }
+        if let Some(client) = self.client_mut()
+            && let Err(err) = client.death_link(options) {
+            // Not being able to send one isn't worth stopping the whole mod.
+            warn!("Failed to send DeathLink: {err:#}");
+        }
+
+        Ok(())
+    }
+
+    /// Puts the game one NG+ cycle higher (capped at NG+7) until the player
+    /// dies. Does nothing if a trap is already active.
+    fn start_ng_trap(&mut self, save_data: &mut SaveData) {
+        if save_data.ng_trap.is_some() {
+            info!("NG+ trap received while one is already active; ignoring");
+            return;
+        }
+
+        let Some(original) = (unsafe { crate::game::EldenRing::ng_level() }) else {
+            warn!("NG+ trap received, but the game data isn't loaded; ignoring");
+            return;
+        };
+        // Pick how many NG+ levels a trap raises the game by, from 1 to 7 (still
+        // capped at NG+7 overall).
+        let raise = fastrand::u32(0..MAX_NG_LEVEL) + 1;
+        let trapped = (original + raise).min(MAX_NG_LEVEL);
+        if trapped == original {
+            info!("NG+ trap received, but the game is already on NG+{original}; ignoring");
+            return;
+        }
+        let actual_raise = trapped - original;
+
+        if unsafe { crate::game::EldenRing::set_ng_level(trapped) } {
+            info!(
+                "NG+ trap: NG+{original} -> NG+{trapped} (raised by {actual_raise}, rolled \
+                 {raise})"
+            );
+            save_data.ng_trap = Some(NgTrap { original, trapped });
+            let plural = if actual_raise == 1 { "" } else { "s" };
+            self.log(RichText::Color {
+                text: format!(
+                    "NG+ Trap! Raised {actual_raise} level{plural}, to NG+{trapped}, until you die."
+                ),
+                color: ap::TextColor::Red,
+            });
+        }
+    }
+
+    /// While an NG+ trap is active, keeps the game on the trapped NG+ level,
+    /// then restores the original level once the player dies.
+    fn handle_ng_trap(&mut self, died: bool) {
+        let mut save_data = SaveData::instance_mut();
+        let Some(save_data) = save_data.as_mut() else {
+            return;
+        };
+
+        if !self.was_dead && let Some(level) = self.ng_trap_restored.take() {
+            self.log(RichText::Color {
+                text: format!("NG+ Trap over. Back to NG+{level}."),
+                color: ap::TextColor::Green,
+            });
+        }
+
+        let Some(trap) = save_data.ng_trap else {
+            return;
+        };
+
+        if died {
+            info!("Player died; ending NG+ trap (back to NG+{})", trap.original);
+            unsafe { crate::game::EldenRing::set_ng_level(trap.original) };
+            save_data.ng_trap = None;
+            self.ng_trap_restored = Some(trap.original);
+            return;
+        }
+
+        if unsafe { crate::game::EldenRing::ng_level() } != Some(trap.trapped) {
+            // The game reloaded the level from the save (which may predate the
+            // trap), so put the trap back.
+            unsafe { crate::game::EldenRing::set_ng_level(trap.trapped) };
+        }
+    }
+
+    /// Tries to start a status trap. This is tracked through having an item in inventory
+    /// so it should not be removed until this succeeds.
+    fn start_status_trap(&mut self) -> bool {
+        let Ok(player) = (unsafe { PlayerIns::local_player_mut() }) else {
+            return false;
+        };
+        if self.last_status_trap_at.elapsed() < STATUS_TRAP_COOLDOWN {
+            return true;
+        }
+        match status::apply_random_status_effect(player) {
+            Some(status) => {
+                // Don't log until actually getting it
+                info!("Status trap: {:?}", status);
+                self.log(vec![
+                    RichText::Color {
+                        text: "Status Trap!".into(),
+                        // Not supported yet
+                        color: ap::TextColor::Bold,
+                    },
+                    " You got ".into(),
+                    RichText::Color {
+                        text: format!("{:?}", status),
+                        color: status::get_status_color(status),
+                    },
+                ]);
+                self.last_status_trap_at = Instant::now();
+                true
+            },
+            None => false,
+        }
+    }
+
+    fn grant_received_item(
+        &mut self,
+        item_man: &mut MapItemMan,
+        id: ItemId,
+        quantity: u32,
+        show_item_popups: bool,
+    ) {
+        if !show_item_popups && let Err(err) = self.suppress_item_get_display(id) {
+            warn!(
+                "Failed to suppress item pickup popup for {:?}; granting normally: {:#}",
+                id, err
+            );
+        }
+
+        item_man.grant_item(ItemBufferEntry::new(id, quantity));
+    }
+
+    fn suppress_item_get_display(&mut self, id: ItemId) -> Result<()> {
+        let restore_at = Instant::now() + ITEM_GET_DISPLAY_SUPPRESSION_DURATION;
+
+        if let Some(restore) = self
+            .item_get_display_restores
+            .iter_mut()
+            .find(|restore| restore.id == id)
+        {
+            set_item_get_display(id, ItemGetDisplay::suppressed())?;
+            restore.restore_at = restore_at;
+            return Ok(());
+        }
+
+        let previous = set_item_get_display(id, ItemGetDisplay::suppressed())?;
+        self.item_get_display_restores.push(ItemGetDisplayRestore {
+            id,
+            previous,
+            restore_at,
+        });
+        Ok(())
+    }
+
+    fn restore_expired_item_get_displays(&mut self) {
+        let now = Instant::now();
+        let mut index = 0;
+
+        while index < self.item_get_display_restores.len() {
+            if self.item_get_display_restores[index].restore_at > now {
+                index += 1;
+                continue;
+            }
+
+            let restore = self.item_get_display_restores.swap_remove(index);
+            if let Err(err) = set_item_get_display(restore.id, restore.previous) {
+                error!(
+                    "Failed to restore item pickup display settings for {:?}: {:#}",
+                    restore.id, err
+                );
+            }
+        }
+    }
+
+    /// Builds and caches the list of locations to poll from the loaded
+    /// regulation. Returns `false` if the regulation isn't available yet (e.g.
+    /// no save loaded).
+    fn ensure_location_flag_mapping(&mut self) -> bool {
+        if self.location_flag_mapping.is_some() {
+            return true;
+        }
+
+        let Some(regulation) = RegulationManager::instance() else {
+            return false;
+        };
+
+        let mapping = checks::build_location_flag_map(&regulation);
+        self.pending_flag_checks = mapping.location_flags.keys().copied().collect();
+        LocationFlagChanges::add_tracked_flags(mapping.flag_locations.keys().copied());
+        self.location_flag_mapping = Some(mapping);
+        self.flag_poll_cursor = 0;
+        true
+    }
+
+    /// Marks a location as checked once the game sets any of its event flags.
+    /// This is how item lots and shop purchases are detected: unlike normal
+    /// pickups, they aren't supposed to leave a placeholder in the inventory
+    /// for `process_inventory_items` to find, so the location's own vanilla
+    /// flag is the only signal.
+    ///
+    /// Only [FLAG_POLL_BATCH_SIZE] locations are checked per call, picking up
+    /// where the last call stopped, so the cost per frame is capped.
+    fn poll_flag_based_checks(&mut self, save_data: &mut SaveData) {
+        if !self.ensure_location_flag_mapping() {
+            return;
+        }
+        let Some(mapping) = &self.location_flag_mapping else {
+            return;
+        };
+
+        // Get the flag manager once for the whole batch, not once per location.
+        let Ok(events) = (unsafe { CSEventFlagMan::instance() }) else {
+            return;
+        };
+
+        let mut checked_locations: HashSet<i64> = HashSet::new();
+        let changed_flags = LocationFlagChanges::take_changed_flags();
+        for flag in changed_flags.iter().as_ref() {
+            let Some(location_ids) = mapping.flag_locations.get(flag) else {
+                continue;
+            };
+            for &location_id in location_ids {
+                if self.check_location_flags(events, save_data, location_id) {
+                    checked_locations.insert(location_id);
+                }
+            }
+        }
+
+        let batch = (self.pending_flag_checks.len() - changed_flags.len()).clamp(0, FLAG_POLL_BATCH_SIZE);
+        for _ in 0..batch {
+            if self.flag_poll_cursor >= self.pending_flag_checks.len() {
+                self.flag_poll_cursor = 0;
+            }
+            let location_id = self.pending_flag_checks[self.flag_poll_cursor];
+            self.flag_poll_cursor += 1;
+            if self.check_location_flags(events, save_data, location_id) {
+                checked_locations.insert(location_id);
+            }
+        }
+
+        // Previously, this removed checked locations from pending_flag_checks,
+        // but this wouldn't be reset in the case of creating a new save file.
+
+        let hinted_flags = LocationFlagChanges::take_hinted_flags();
+        let hinted_locs: HashSet<i64> = hinted_flags.iter()
+            .flat_map(|flag| mapping.flag_locations.get(flag)).flatten().copied()
+            .filter(|&loc| self.hinted_locations.insert(loc))
+            .collect();
+        if !hinted_locs.is_empty() && let Some(client) = self.client_mut() {
+            match client.create_hints(hinted_locs.iter().copied()) {
+                Ok(_) => info!("Hinted location IDs: {:?}", hinted_locs),
+                Err(e) => info!("Failed to hint location IDs: {:?}\n{}", hinted_locs, e),
+            };
+        }
+
+    }
+
+    fn check_location_flags(&self, events: &CSEventFlagMan, save_data: &mut SaveData, location_id: i64) -> bool {
+        let Some(mapping) = &self.location_flag_mapping else {
+            return false;
+        };
+        let Some(flags) = mapping.location_flags.get(&location_id) else {
+            return false;
+        };
+
+        let already_checked = save_data.locations.contains(&location_id);
+        let checked = already_checked
+            || flags
+                .iter()
+                // TODO: This is abyssmally inefficient as it doesn't use tree lookup.
+                // Update fromsoftware-rs or call the game's impl to fix this.
+                .any(|flag| events.virtual_memory_flag.get_flag(u32::from(*flag)));
+
+        if checked && !already_checked {
+            info!("Archipelago location {} checked via event flag", location_id);
+            save_data.locations.insert(location_id);
+            return true;
+        }
+        return false;
+    }
+
+    /// Removes placeholder items from the inventory and tells the server their
+    /// locations were reached.
+    fn process_inventory_items(&mut self) -> Result<()> {
+        let Some(ref mut save_data) = SaveData::instance_mut() else {
+            return Ok(());
+        };
+        let Ok(game_data_man) = (unsafe { GameDataMan::instance_mut() }) else {
+            return Ok(());
+        };
+        let Ok(item_man) = (unsafe { MapItemMan::instance_mut() }) else {
+            return Ok(());
+        };
+        let Some(client) = self.client() else {
+          return Ok(());
+        };
+        if self.trap_items.is_empty() {
+            self.trap_items = TRAP_ITEM_NAMES.iter()
+                .flat_map(|&name| client.this_game().item_by_name(name)
+                    .and_then(|item| client.slot_data().ap_ids_to_item_ids.get(&I64Key(item.id())))
+                    .map(|item_id| (item_id.0, name.to_owned())))
+                .collect()
+        }
+
+        // Collect into a separate vector so we aren't borrowing while we make
+        // changes. Filtering during the walk keeps it to a handful of entries
+        // instead of copying the whole inventory every time.
+        let ids = if due(&mut self.last_inventory_scan, INVENTORY_SCAN_INTERVAL) {
+            game_data_man
+                .main_player_game_data
+                .equipment
+                .equip_inventory_data
+                .items_data
+                .items()
+                .map(|e| e.item_id)
+                .filter(|id| id.is_archipelago() || self.trap_items.contains_key(id))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for id in ids {
+            // Traps and AP items could be done in separate passes, but both are removed for the time being
+            match self.trap_items.get(&id) {
+                // Ideally this should remove all instances of these traps from inventory instead of
+                // just 1, but they will still be processed later in this loop.
+                Some(name) if name == NG_PLUS_TRAP_ITEM_NAME => {
+                    self.start_ng_trap(save_data);
+                },
+                Some(name) if name == STATUS_TRAP_ITEM_NAME => {
+                    if !self.start_status_trap() {
+                        continue;
+                    }
+                },
+                _ => {
+                    info!(
+                        "Removing {} placeholder {:?}",
+                        if id.is_local_archipelago() { "local" } else { "foreign" },
+                        id
+                    );
+                },
+            };
+            game_data_man.remove_item(id, 1);
+        }
+
+        self.poll_flag_based_checks(save_data);
+        self.poll_dungeon_sweep(save_data);
+
+        // The virtual-location passes all walk the checked-location set, which
+        // grows into the thousands. Run them when the set actually changed, and
+        // otherwise only on a slow timer as a backstop for state that changed
+        // elsewhere (a late server connection, say).
+        let locations_changed = save_data.locations.len() != self.locations_seen;
+        if locations_changed
+            || due(
+                &mut self.last_virtual_location_sync,
+                VIRTUAL_LOCATION_SYNC_INTERVAL,
+            )
+        {
+            self.grant_local_location_items(item_man, save_data);
+        }
+        self.locations_seen = save_data.locations.len();
+
+        if save_data.locations.len() != self.locations_sent
+            && let Some(client) = self.client_mut()
+        {
+            client.mark_checked(save_data.locations.iter().copied())?;
+            self.locations_sent = save_data.locations.len();
+        }
+        Ok(())
+    }
+
+    /// Whether Dungeon Sweep is on: the server's setting, unless the player
+    /// changed it with `!sweep`.
+    fn dungeon_sweep_enabled(&self) -> bool {
+        let server_enabled = self
+            .client()
+            .map(|client| client.slot_data().options.dungeon_sweep)
+            .unwrap_or(false);
+        self.dungeon_sweep.is_enabled(server_enabled)
+    }
+
+    /// Dungeon Sweep: when a dungeon's boss is beaten, marks every location in
+    /// that dungeon as checked. The caller's normal pass then reports them to
+    /// the server and grants any local items. Does nothing unless it's on
+    /// (see [Core::dungeon_sweep_enabled]).
+    fn poll_dungeon_sweep(&mut self, save_data: &mut SaveData) {
+        let menu_returns = SaveData::menu_returns();
+        if menu_returns != self.dungeon_sweep_menu_returns {
+            self.dungeon_sweep_menu_returns = menu_returns;
+            self.dungeon_sweep.reset();
+        }
+
+        if !self.dungeon_sweep_enabled() {
+            return;
+        }
+
+        if self.dungeon_sweep.needs_groups() {
+            if !self.ensure_location_flag_mapping() {
+                return;
+            }
+            if let Some(mapping) = &self.location_flag_mapping {
+                self.dungeon_sweep.build_groups(&mapping.location_flags);
+            }
+        }
+
+        let results = self
+            .dungeon_sweep
+            .poll(true, &mut save_data.locations, get_event_flag);
+        for result in &results {
+            info!(
+                "Dungeon Sweep: {} boss beaten, {} new locations",
+                result.name, result.newly_checked
+            );
+        }
+        // Only the most recently swept dungeon is announced in chat, and only
+        // while `!uisweep` has messages turned on.
+        if let Some(result) = self.dungeon_sweep.to_announce(&results) {
+            self.log(RichText::Color {
+                text: format!(
+                    "Dungeon Sweep: {} boss beaten ({} checks sent).",
+                    result.name, result.newly_checked
+                ),
+                color: ap::TextColor::Green,
+            });
+        }
+    }
+
+    /// Makes sure the server has told us which item is at each of this game's
+    /// locations, and returns whether that answer is in yet.
+    ///
+    /// The randomizer's local placeholders don't carry the real item, and the
+    /// server doesn't send a player's own items back to them. So the only way
+    /// to know what a local pickup should give is to ask the server (a
+    /// "scout"). We do that once for every location and cache the answer.
+    fn update_local_item_scout(&mut self) -> bool {
+        if self.local_location_items.is_some() {
+            return true;
+        }
+
+        // Pick up the answer, if it's arrived.
+        let response = self.local_item_scout.as_mut().and_then(|poll| poll());
+        match response {
+            Some(Ok(located)) => {
+                let own_items = {
+                    let Some(client) = self.client() else {
+                        return false;
+                    };
+                    let me = client.this_player();
+                    located
+                        .iter()
+                        .filter(|entry| {
+                            entry.receiver().team() == me.team()
+                                && entry.receiver().slot() == me.slot()
+                        })
+                        .map(|entry| (entry.location().id(), entry.item().id()))
+                        .collect::<HashMap<_, _>>()
+                };
+                info!(
+                    "Scouted {} location(s): {} hold this player's own items",
+                    located.len(),
+                    own_items.len()
+                );
+                self.local_item_scout = None;
+                self.local_location_items = Some(own_items);
+                return true;
+            }
+            Some(Err(err)) => {
+                warn!("Scouting locations failed; will retry: {:#}", err);
+                self.local_item_scout = None;
+            }
+            None => {}
+        }
+
+        // Still waiting on a request that's out.
+        if self.local_item_scout.is_some()
+            && self
+                .local_item_scout_requested
+                .is_some_and(|at| at.elapsed() < LOCAL_ITEM_SCOUT_TIMEOUT)
+        {
+            return false;
+        }
+
+        // Ask (or ask again).
+        let Some(client) = self.client_mut() else {
+            return false;
+        };
+        let mut location_ids = client
+            .unchecked_locations()
+            .map(|location| location.id())
+            .collect::<Vec<_>>();
+        location_ids.extend(client.checked_locations().map(|location| location.id()));
+
+        info!("Scouting {} location(s) for their items", location_ids.len());
+        let receiver = client.scout_locations(location_ids, ap::CreateAsHint::No);
+        self.local_item_scout = Some(Box::new(move || receiver.try_recv().ok()));
+        self.local_item_scout_requested = Some(Instant::now());
+        false
+    }
+
+    /// Grants the real item for every checked location of this game that holds
+    /// one of the player's own items. Locations with another player's item are
+    /// left alone and stay placeholders.
+    ///
+    /// Handled locations are tracked in
+    /// `SaveData::local_virtual_items_granted`, which is saved, so each
+    /// location grants at most once. This can spam a lot when loading into
+    /// a preexisting save file which is what !overridesave is for.
+    fn grant_local_location_items(&mut self, item_man: &mut MapItemMan, save_data: &mut SaveData) {
+        if !self.update_local_item_scout() {
+            return;
+        }
+
+        let mut unmapped = Vec::new();
+        let pending_grants = {
+            let (Some(client), Some(own_items)) = (self.client(), self.local_location_items.as_ref())
+            else {
+                return;
+            };
+            let slot_data = client.slot_data();
+
+            save_data
+                .locations
+                .iter()
+                .copied()
+                .filter(|location_id| {
+                    !save_data
+                        .local_virtual_items_granted
+                        .contains(location_id)
+                })
+                .filter_map(|location_id| {
+                    let ap_item_id = *own_items.get(&location_id)?;
+                    let Some(er_id) = slot_data.ap_ids_to_item_ids.get(&I64Key(ap_item_id)) else {
+                        warn!(
+                            "Location {} contains AP item {}, but slot data has no ER item ID",
+                            location_id, ap_item_id
+                        );
+                        unmapped.push(location_id);
+                        return None;
+                    };
+                    let quantity = slot_data
+                        .item_counts
+                        .get(&I64Key(ap_item_id))
+                        .copied()
+                        .unwrap_or(1);
+                    let item_name = client
+                        .this_game()
+                        .item(ap_item_id)
+                        .map(|item| item.name().to_owned())
+                        .unwrap_or_else(|| format!("<item #{}>", ap_item_id));
+                    let location_name = client
+                        .this_game()
+                        .location(location_id)
+                        .map(|location| location.name().to_owned())
+                        .unwrap_or_else(|| format!("<location #{}>", location_id));
+
+                    Some(LocalVirtualItemGrant {
+                        location_id,
+                        location_name,
+                        ap_item_id,
+                        item_name,
+                        er_id: er_id.0,
+                        quantity,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Nothing can ever be granted for these, so stop warning about them.
+        for location_id in unmapped {
+            save_data.local_virtual_items_granted.insert(location_id);
+        }
+
+        for grant in pending_grants {
+            info!(
+                "Granting own item {}x {} (AP ID {}, ER ID {:?}) for {}",
+                grant.quantity, grant.item_name, grant.ap_item_id, grant.er_id, grant.location_name
+            );
+            // The placeholder is dropped before it's granted (see
+            // `on_grant_items`), so this is the only pop-up the pickup gets,
+            // and it should show.
+            self.grant_received_item(item_man, grant.er_id, grant.quantity, true);
+            save_data
+                .local_virtual_items_granted
+                .insert(grant.location_id);
+            self.last_item_time = Instant::now();
+        }
+    }
+
+    /// Detects when the player has won and tells the server.
+    fn handle_goal(&mut self) -> Result<()> {
+        if !self.sent_goal
+            && let Some(client) = self.client_mut()
+            && client
+                .slot_data()
+                .goal
+                .iter()
+                .all(|flag| get_event_flag(*flag).unwrap_or(false))
+        {
+            client.set_status(ap::ClientStatus::Goal)?;
+            self.sent_goal = true;
+        }
+
+        Ok(())
+    }
+
+    /// Applies speffect which randomizer uses to confirm the client is connected.
+    fn set_player_presence(&self, sp_effect: i32) {
+        if let Ok(world_chr_man) = (unsafe { WorldChrMan::instance_mut() })
+            && let Some(player) = world_chr_man.main_player.as_mut() {
+            player.apply_speffect(sp_effect, true);
+        };
+    }
+
+    fn remove_item_for_console(&self, name: &str) -> Result<()> {
+        let client = self.client().context("Client not connected")?;
+        let item = client.this_game().item_by_name(name)
+            .and_then(|item| client.slot_data().ap_ids_to_item_ids.get(&I64Key(item.id())))
+            .context("Unknown item name")?.0;
+        let game_data_man = unsafe { GameDataMan::instance_mut() }
+            .context("GameDataMan not loaded")?;
+        if !has_item_in_inventory(game_data_man, item) {
+            bail!("Item not found in inventory");
+        }
+        game_data_man.remove_item(item, 1);
+        Ok(())
+    }
+}
+
+fn has_item_in_inventory(game_data_man: &GameDataMan, item_id: ItemId) -> bool {
+    game_data_man
+        .main_player_game_data
+        .equipment
+        .equip_inventory_data
+        .items_data
+        .items()
+        .any(|entry| entry.item_id == item_id && entry.quantity > 0)
+}
+
+/// Whether a periodic pass is due; records the time if so.
+///
+/// `last` is `None` until the first run, so every pass runs once on the first
+/// tick and then settles into its interval.
+fn due(last: &mut Option<Instant>, interval: Duration) -> bool {
+    let now = Instant::now();
+    match last {
+        Some(last) if now.duration_since(*last) < interval => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+fn get_event_flag(flag: EventFlagId) -> Option<bool> {
+    let events = unsafe { CSEventFlagMan::instance() }.ok()?;
+    Some(events.virtual_memory_flag.get_flag(u32::from(flag)))
+}
+
+fn set_event_flag(flag: EventFlagId, value: bool) -> bool {
+    let Ok(events) = (unsafe { CSEventFlagMan::instance_mut() }) else {
+        return false;
+    };
+    events.virtual_memory_flag.set_flag(u32::from(flag), value);
+    true
+}
+
+#[derive(Clone, Copy)]
+struct ItemGetDisplay {
+    show_log: bool,
+    show_dialog: u8,
+}
+
+impl ItemGetDisplay {
+    fn suppressed() -> Self {
+        Self {
+            show_log: true,
+            show_dialog: 0,
+        }
+    }
+}
+
+struct ItemGetDisplayRestore {
+    id: ItemId,
+    previous: ItemGetDisplay,
+    restore_at: Instant,
+}
+
+fn set_item_get_display(id: ItemId, display: ItemGetDisplay) -> Result<ItemGetDisplay> {
+    let row = unsafe { SoloParamRepository::instance_mut() }?
+        .get_equip_param_mut(id)
+        .with_context(|| format!("no row for item ID {:?}", id))?;
+
+    macro_rules! set {
+        ($row:expr) => {{
+            let previous = ItemGetDisplay {
+                show_log: $row.show_log_cond_type(),
+                show_dialog: $row.show_dialog_cond_type(),
+            };
+            $row.set_show_log_cond_type(display.show_log);
+            $row.set_show_dialog_cond_type(display.show_dialog);
+            previous
+        }};
+    }
+
+    Ok(match row {
+        EquipParamStructMut::EQUIP_PARAM_ACCESSORY_ST(row) => set!(row),
+        EquipParamStructMut::EQUIP_PARAM_GEM_ST(row) => set!(row),
+        EquipParamStructMut::EQUIP_PARAM_GOODS_ST(row) => set!(row),
+        EquipParamStructMut::EQUIP_PARAM_PROTECTOR_ST(row) => set!(row),
+        EquipParamStructMut::EQUIP_PARAM_WEAPON_ST(row) => set!(row),
+    })
+}

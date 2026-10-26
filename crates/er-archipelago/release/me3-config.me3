@@ -1,0 +1,13 @@
+profileVersion = "v1"
+
+[[supports]]
+game = "eldenring"
+
+[[natives]]
+path = "er_archipelago.dll"
+
+[[natives]]
+path = "randomizer/dll/RandomizerCrashFix.dll"
+
+[[packages]]
+path = "randomizer"
