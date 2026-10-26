@@ -1,5 +1,7 @@
+use std::io::Read;
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Once};
 use std::{ffi::OsString, io, sync::LazyLock};
 
 use anyhow::{Error, Result};
@@ -87,5 +89,57 @@ impl<Label> PopupModalExt for PopupModal<'_, '_, Label> {
     fn size(self, size: impl Into<Vector2<f32>>, condition: Condition) -> Self {
         unsafe { imgui_sys::igSetNextWindowSize(size.into().into(), condition as i32) };
         self
+    }
+}
+
+/// Asynchronous loader for files in the mod's directory, to avoid blocking the
+/// game thread on file reads.
+///
+/// As an alternate, there could be a method in `Core` for loading these things upfront.
+pub struct LazyFileReader {
+    name: &'static str,
+    load_file: Once,
+    // Why not
+    data: LazyLock<Arc<Mutex<Option<Vec<u8>>>>>,
+}
+
+impl LazyFileReader {
+    /// Creates a reader for the given file name. This can be done statically.
+    pub const fn new(name: &'static str) -> Self {
+        Self { name, load_file: Once::new(), data: LazyLock::new(|| Arc::new(Mutex::new(None))) }
+    }
+
+    /// Returns the contents of the file at most once. The first time this is called, it spawns
+    /// a thread to read the file. Before and after the data is available, it returns `None`.
+    /// If the file cannot be read, it logs a warning and will never return anything.
+    pub fn take_data(&self) -> Option<Vec<u8>> {
+        self.load_file.call_once(|| {
+            let Ok(mod_dir) = mod_directory() else {
+                return;
+            };
+            let mut path = mod_dir.to_path_buf();
+            path.push(self.name);
+            let data_lock = self.data.clone();
+            std::thread::spawn(move || {
+                match Self::read_data(&path) {
+                    Ok(bytes) => {
+                        let mut data = data_lock.lock().unwrap();
+                        *data = Some(bytes);
+                    },
+                    Err(err) => {
+                        log::warn!("Could not load {:?}: {}", path, err);
+                    }
+                }
+            });
+        });
+        let mut data = self.data.lock().unwrap();
+        data.take()
+    }
+
+    fn read_data(path: &PathBuf) -> Result<Vec<u8>> {
+        let mut bytes = vec![];
+        let mut file = std::fs::File::open(path)?;
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 }

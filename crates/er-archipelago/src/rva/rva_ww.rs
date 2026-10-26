@@ -9,9 +9,9 @@ use super::RvaBundle;
 /// These are populated from `mapper-profile.toml` in the root of this package
 /// using `tools/binary-generator`.
 pub const RVAS: RvaBundle = RvaBundle {
-buy_menu_gaitem: 0x79a790,
-get_shop_menu_list: 0x84e7c0,
-load_tpf_res_cap: 0xb84da0,
-set_event_flag: 0x5faa40,
-set_event_value: 0x5d3080,
+buy_menu_gaitem: 0x79ac40,
+get_shop_menu_list: 0x84ec70,
+load_tpf_res_cap: 0xb85260,
+set_event_flag: 0x5faef0,
+set_event_value: 0x5d3530,
 };

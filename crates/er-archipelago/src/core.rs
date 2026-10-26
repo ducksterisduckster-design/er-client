@@ -11,7 +11,7 @@ use fromsoftware_shared::FromStatic;
 use log::*;
 use regex_macro::regex;
 
-use crate::checks;
+use crate::{checks, game::status};
 use crate::checks::{LocationFlagChanges, LocationFlagMapping};
 use crate::dungeon_sweep::DungeonSweep;
 use crate::item::{ItemIdExt, RegulationManager};
@@ -57,49 +57,29 @@ const LOAD_GRACE_PERIOD: Duration = Duration::from_secs(6);
 /// Speffect to apply always to indicate the client is present.
 /// This should be set within a second of event scripts starting to run.
 const LOADED_SPEFFECT: i32 = 81000001;
+
 /// Speffect to apply if all processing is being successfully completely.
 const PROCESSING_SPEFFECT: i32 = 81000002;
 
-/// The Archipelago item name of the NG+ trap.
+/// Archipelago item name of NG+ Trap
 const NG_PLUS_TRAP_ITEM_NAME: &str = "NG+ Trap";
 
+/// The highest NG+ scaling level the game has.
+const MAX_NG_LEVEL: u32 = 7;
+
+/// Archipelago item name of Status Trap
+const STATUS_TRAP_ITEM_NAME: &str = "Status Trap";
+
+const STATUS_TRAP_COOLDOWN: Duration = Duration::from_secs(1);
+
 /// All Archipelago trap names.
-const TRAP_ITEM_NAMES: [&str; 1] = [NG_PLUS_TRAP_ITEM_NAME];
-
-/// Picks how many NG+ levels a trap raises the game by, from 1 to 7 (still
-/// capped at NG+7 overall). Uses a lightweight PRNG rather than a `rand`
-/// dependency, seeded from the current time.
-fn random_ng_raise() -> u32 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static STATE: AtomicU64 = AtomicU64::new(0);
-
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mixed = STATE.fetch_add(seed | 1, Ordering::Relaxed) ^ seed;
-
-    // xorshift64, then reduce to 1..=MAX_NG_LEVEL.
-    let mut x = mixed;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    1 + (x % u64::from(MAX_NG_LEVEL)) as u32
-}
-
-/// The cause sent with, and shown for, a DeathLink when the local player dies.
-const DEATH_LINK_CAUSE: &str = "Elden Ring died";
+const TRAP_ITEM_NAMES: [&str; 2] = [NG_PLUS_TRAP_ITEM_NAME, STATUS_TRAP_ITEM_NAME];
 
 /// After a death is noticed, further deaths are ignored for this long. Death
 /// is spotted through several signals that don't all change on the same frame,
 /// and a real second death can't happen faster than the death screen and
 /// respawn allow.
 const DEATH_COOLDOWN: Duration = Duration::from_secs(30);
-
-/// The highest NG+ cycle the game has.
-const MAX_NG_LEVEL: u32 = 7;
 
 
 /// Checks an outstanding location scout and returns the result once the server
@@ -182,6 +162,8 @@ pub struct Core {
     /// seconds, and the death and loading screens can use them all up).
     ng_trap_restored: Option<u32>,
 
+    last_status_trap_at: Instant,
+
     /// The pending request asking the server which item sits at each of this
     /// game's locations, and when we sent it.
     local_item_scout: Option<ScoutPoll>,
@@ -224,10 +206,11 @@ impl shared::Core for Core {
 
     /// Creates a new instance of the mod.
     fn new() -> Result<Self> {
+        let now = Instant::now();
         Ok(Self {
             base: CoreBase::new("EldenRing")?,
             should_process_save_file: ShouldProcess::Ok,
-            last_item_time: Instant::now(),
+            last_item_time: now,
             locations_sent: 0,
             sent_goal: false,
             item_get_display_restores: Vec::new(),
@@ -244,6 +227,7 @@ impl shared::Core for Core {
             last_death_at: None,
             trap_items: HashMap::new(),
             ng_trap_restored: None,
+            last_status_trap_at: now,
             local_item_scout: None,
             local_item_scout_requested: None,
             local_location_items: None,
@@ -425,6 +409,22 @@ impl shared::Core for Core {
                 }
                 true
             },
+
+            "!applysp" => {
+                let Some(sp_effect) = arg.and_then(|f| i32::from_str(f).ok()) else {
+                    arg_error("!applysp SP_EFFECT");
+                    return true;
+                };
+                self.set_player_presence(sp_effect);
+                self.log(vec![
+                    "Applied ".into(),
+                    RichText::Color {
+                        text: format!("{:?}", sp_effect),
+                        color: ap::TextColor::Blue,
+                    },
+                ]);
+                true
+            }
 
             "!sweep" => {
                 // No argument toggles; `on` / `off` set it explicitly.
@@ -684,42 +684,6 @@ impl Core {
         }
     }
 
-    /// Puts the game one NG+ cycle higher (capped at NG+7) until the player
-    /// dies. Does nothing if a trap is already active.
-    fn start_ng_trap(&mut self, save_data: &mut SaveData) {
-        if save_data.ng_trap.is_some() {
-            info!("NG+ trap received while one is already active; ignoring");
-            return;
-        }
-
-        let Some(original) = (unsafe { crate::game::EldenRing::ng_level() }) else {
-            warn!("NG+ trap received, but the game data isn't loaded; ignoring");
-            return;
-        };
-        let raise = random_ng_raise();
-        let trapped = (original + raise).min(MAX_NG_LEVEL);
-        if trapped == original {
-            info!("NG+ trap received, but the game is already on NG+{original}; ignoring");
-            return;
-        }
-        let actual_raise = trapped - original;
-
-        if unsafe { crate::game::EldenRing::set_ng_level(trapped) } {
-            info!(
-                "NG+ trap: NG+{original} -> NG+{trapped} (raised by {actual_raise}, rolled \
-                 {raise})"
-            );
-            save_data.ng_trap = Some(NgTrap { original, trapped });
-            let plural = if actual_raise == 1 { "" } else { "s" };
-            self.log(RichText::Color {
-                text: format!(
-                    "NG+ Trap! Raised {actual_raise} level{plural}, to NG+{trapped}, until you die."
-                ),
-                color: ap::TextColor::Red,
-            });
-        }
-    }
-
     /// Notices whether the local player died since the last tick. Uses every
     /// signal we have (the death flag, HP reaching zero, and the death count
     /// going up), since no single one has proven reliable on its own.
@@ -770,6 +734,85 @@ impl Core {
         true
     }
 
+    /// Sends a DeathLink when the local player dies. Incoming DeathLinks are
+    /// handled in [shared::Core::take_events], which kills the player. Does
+    /// nothing unless DeathLink is enabled in the config.
+    fn handle_death_link(&mut self, died: bool) -> Result<()> {
+        if !died || !self.base().config().death_link_enabled() {
+            return Ok(());
+        }
+
+        // A death caused by someone else's DeathLink isn't ours to send back.
+        // Otherwise a single death would bounce between players forever.
+        if crate::game::EldenRing::take_death_link_kill() {
+            return Ok(());
+        }
+
+        let Some(client) = self.client() else {
+            return Ok(());
+        };
+        // From network protocol: if cause is non-empty, it should contain the player name.
+        let game_cause = unsafe { crate::game::EldenRing::get_death_cause(client.this_player().alias()) };
+        let console_msg = game_cause.clone().unwrap_or_else(|| format!("{} died", client.this_player().alias()));
+        self.log(vec![
+            RichText::Color {
+                text: "DeathLink: ".into(),
+                color: ap::TextColor::Red,
+            },
+            console_msg.into(),
+        ]);
+
+        let mut options = ap::DeathLinkOptions::new();
+        if let Some(cause) = game_cause {
+            options = options.cause(cause);
+        }
+        if let Some(client) = self.client_mut()
+            && let Err(err) = client.death_link(options) {
+            // Not being able to send one isn't worth stopping the whole mod.
+            warn!("Failed to send DeathLink: {err:#}");
+        }
+
+        Ok(())
+    }
+
+    /// Puts the game one NG+ cycle higher (capped at NG+7) until the player
+    /// dies. Does nothing if a trap is already active.
+    fn start_ng_trap(&mut self, save_data: &mut SaveData) {
+        if save_data.ng_trap.is_some() {
+            info!("NG+ trap received while one is already active; ignoring");
+            return;
+        }
+
+        let Some(original) = (unsafe { crate::game::EldenRing::ng_level() }) else {
+            warn!("NG+ trap received, but the game data isn't loaded; ignoring");
+            return;
+        };
+        // Pick how many NG+ levels a trap raises the game by, from 1 to 7 (still
+        // capped at NG+7 overall).
+        let raise = fastrand::u32(0..MAX_NG_LEVEL) + 1;
+        let trapped = (original + raise).min(MAX_NG_LEVEL);
+        if trapped == original {
+            info!("NG+ trap received, but the game is already on NG+{original}; ignoring");
+            return;
+        }
+        let actual_raise = trapped - original;
+
+        if unsafe { crate::game::EldenRing::set_ng_level(trapped) } {
+            info!(
+                "NG+ trap: NG+{original} -> NG+{trapped} (raised by {actual_raise}, rolled \
+                 {raise})"
+            );
+            save_data.ng_trap = Some(NgTrap { original, trapped });
+            let plural = if actual_raise == 1 { "" } else { "s" };
+            self.log(RichText::Color {
+                text: format!(
+                    "NG+ Trap! Raised {actual_raise} level{plural}, to NG+{trapped}, until you die."
+                ),
+                color: ap::TextColor::Red,
+            });
+        }
+    }
+
     /// While an NG+ trap is active, keeps the game on the trapped NG+ level,
     /// then restores the original level once the player dies.
     fn handle_ng_trap(&mut self, died: bool) {
@@ -801,6 +844,38 @@ impl Core {
             // The game reloaded the level from the save (which may predate the
             // trap), so put the trap back.
             unsafe { crate::game::EldenRing::set_ng_level(trap.trapped) };
+        }
+    }
+
+    /// Tries to start a status trap. This is tracked through having an item in inventory
+    /// so it should not be removed until this succeeds.
+    fn start_status_trap(&mut self) -> bool {
+        let Ok(player) = (unsafe { PlayerIns::local_player_mut() }) else {
+            return false;
+        };
+        if self.last_status_trap_at.elapsed() < STATUS_TRAP_COOLDOWN {
+            return true;
+        }
+        match status::apply_random_status_effect(player) {
+            Some(status) => {
+                // Don't log until actually getting it
+                info!("Status trap: {:?}", status);
+                self.log(vec![
+                    RichText::Color {
+                        text: "Status Trap!".into(),
+                        // Not supported yet
+                        color: ap::TextColor::Bold,
+                    },
+                    " You got ".into(),
+                    RichText::Color {
+                        text: format!("{:?}", status),
+                        color: status::get_status_color(status),
+                    },
+                ]);
+                self.last_status_trap_at = Instant::now();
+                true
+            },
+            None => false,
         }
     }
 
@@ -1012,8 +1087,15 @@ impl Core {
         for id in ids {
             // Traps and AP items could be done in separate passes, but both are removed for the time being
             match self.trap_items.get(&id) {
+                // Ideally this should remove all instances of these traps from inventory instead of
+                // just 1, but they will still be processed later in this loop.
                 Some(name) if name == NG_PLUS_TRAP_ITEM_NAME => {
                     self.start_ng_trap(save_data);
+                },
+                Some(name) if name == STATUS_TRAP_ITEM_NAME => {
+                    if !self.start_status_trap() {
+                        continue;
+                    }
                 },
                 _ => {
                     info!(
@@ -1283,40 +1365,7 @@ impl Core {
         Ok(())
     }
 
-    /// Sends a DeathLink when the local player dies. Incoming DeathLinks are
-    /// handled in [shared::Core::take_events], which kills the player. Does
-    /// nothing unless DeathLink is enabled in the config.
-    fn handle_death_link(&mut self, died: bool) -> Result<()> {
-        if !died || !self.base().config().death_link_enabled() {
-            return Ok(());
-        }
-
-        // A death caused by someone else's DeathLink isn't ours to send back.
-        // Otherwise a single death would bounce between players forever.
-        if crate::game::EldenRing::take_death_link_kill() {
-            return Ok(());
-        }
-
-        self.log(vec![
-            RichText::Color {
-                text: "DeathLink: ".into(),
-                color: ap::TextColor::Red,
-            },
-            DEATH_LINK_CAUSE.to_string().into(),
-        ]);
-
-        if let Some(client) = self.client_mut()
-            && let Err(err) =
-                client.death_link(ap::DeathLinkOptions::new().cause(DEATH_LINK_CAUSE.to_string()))
-        {
-            // Not being able to send one isn't worth stopping the whole mod.
-            warn!("Failed to send DeathLink: {err:#}");
-        }
-
-        Ok(())
-    }
-
-    /// Applies speffect 81000001 which randomizer uses to confirm the client is connected.
+    /// Applies speffect which randomizer uses to confirm the client is connected.
     fn set_player_presence(&self, sp_effect: i32) {
         if let Ok(world_chr_man) = (unsafe { WorldChrMan::instance_mut() })
             && let Some(player) = world_chr_man.main_player.as_mut() {

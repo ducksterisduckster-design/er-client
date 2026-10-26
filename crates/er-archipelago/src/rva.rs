@@ -9,7 +9,7 @@ mod rva_ww;
 pub use bundle::RvaBundle;
 
 const NAME: &str = "ELDEN RING™";
-const WW_VERSION: &str = "2.7.1.0";
+const WW_VERSION: &str = "2.7.2.0";
 const LANG_ID_EN: u16 = 0x0009;
 
 /// Returns the RVA bundle for the current executable region and version.

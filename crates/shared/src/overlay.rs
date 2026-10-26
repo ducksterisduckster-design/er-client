@@ -429,7 +429,7 @@ impl<G: Game> Overlay<G> {
             .position_pivot([0.5, 0.5])
             .collapsible(false)
             .build(|| {
-                ui.text("Font Size ");
+                ui.text("Font size ");
                 ui.same_line();
                 if ui.button("-##font-size-decrease-button") {
                     self.font_scale = (self.font_scale - 0.1).max(0.5);
@@ -443,7 +443,7 @@ impl<G: Game> Overlay<G> {
 
                 let mut opacity_percent = (self.unfocused_window_opacity * 100.0).round() as i32;
                 let _slider_width = ui.push_item_width(150. * self.font_scale);
-                ui.text("Unfocused Opacity ");
+                ui.text("Unfocused opacity ");
                 ui.same_line();
                 ui.slider_config("##unfocused-opacity-slider", 0, 100)
                     .display_format("%d%%")
@@ -457,7 +457,7 @@ impl<G: Game> Overlay<G> {
 
                 if G::SUPPORTS_ITEM_POPUP_SETTING {
                     let mut show_item_popups = core.base().show_item_popups();
-                    if ui.checkbox("Show Incoming Item Popups", &mut show_item_popups)
+                    if ui.checkbox("Show incoming item popups", &mut show_item_popups)
                         && let Err(e) = core.base_mut().update_show_item_popups(show_item_popups)
                     {
                         error!("Failed to save item popup setting: {e}");
@@ -467,7 +467,7 @@ impl<G: Game> Overlay<G> {
                         let mut show_progression_item_popups =
                             core.base().show_progression_item_popups();
                         if ui.checkbox(
-                            "Show pop-ups for progression items",
+                            "Show popups for progression items",
                             &mut show_progression_item_popups,
                         ) && let Err(e) = core
                             .base_mut()
@@ -476,6 +476,13 @@ impl<G: Game> Overlay<G> {
                             error!("Failed to save progression item popup setting: {e}");
                         }
                     }
+                }
+
+                let mut death_link_enabled = core.base().config().death_link_enabled();
+                if ui.checkbox("Enable DeathLink", &mut death_link_enabled)
+                    && let Err(e) = core.base_mut().update_death_link_enabled(death_link_enabled)
+                {
+                    error!("Failed to save deathlink setting: {e}");
                 }
 
                 if ui.button("Ok") {
